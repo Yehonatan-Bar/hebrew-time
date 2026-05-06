@@ -1,0 +1,51 @@
+# Archives
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.svg
+*.ico
+*.tif
+*.tiff
+*.webp
+
+# Resource and test directories
+Resources/
+tests/
+
+# macOS metadata
+__MACOSX/
+.DS_Store
+**/.DS_Store
+._*
+**/._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor files
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Build artifacts
+build/
+dist/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
