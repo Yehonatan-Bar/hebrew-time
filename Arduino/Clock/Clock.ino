@@ -22,8 +22,9 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <time.h>
+#include <stdlib.h>
 #include "esp_sleep.h"
-#include <Fonts/Custom/Heebo_Bold_100.h>
+#include <Fonts/Custom/Heebo_Bold_72.h>
 #include "time_words.h"
 #include "secrets.h"
 
@@ -37,7 +38,8 @@ const char* password = WIFI_PASSWORD;
 
 // ── NTP ───────────────────────────────────────────────
 const char* ntpServer          = "pool.ntp.org";
-const char* timeZone           = "UTC-6"; // POSIX TZ: "UTC-6" means UTC+6
+const char* timeZone           = "IST-2IDT,M3.4.4/26,M10.5.0"; // Israel: UTC+2 standard, UTC+3 during DST
+const bool  ENABLE_TIME_DEBUG  = true;
 
 // ── Sleep / refresh schedule ──────────────────────────
 #define SLEEP_FAST_SEC   120
@@ -48,7 +50,7 @@ const char* timeZone           = "UTC-6"; // POSIX TZ: "UTC-6" means UTC+6
 #define SCREEN_W         800
 #define SCREEN_H         480
 #define TEXT_SCALE       1
-#define FONT_BASE_H      100
+#define FONT_BASE_H      72
 #define HEBREW_SPACE_W   20
 #define LINE_GAP         24
 
@@ -62,6 +64,22 @@ const char* timeZone           = "UTC-6"; // POSIX TZ: "UTC-6" means UTC+6
 RTC_DATA_ATTR int  ntpDay    = -1;
 RTC_DATA_ATTR int  bootCount = 0;
 RTC_DATA_ATTR bool firstBoot = true;
+
+struct TimeDebugSnapshot {
+  time_t epoch;
+  int    localYday;
+  int    localHour;
+  int    localMin;
+  int    utcYday;
+  int    utcHour;
+  int    utcMin;
+  int    ntpDay;
+  int    bootCount;
+  bool   firstBoot;
+};
+
+RTC_DATA_ATTR TimeDebugSnapshot lastSleepSnapshot;
+RTC_DATA_ATTR bool              lastSleepSnapshotValid = false;
 
 // ── Types ─────────────────────────────────────────────
 struct HebrewToken {
@@ -79,6 +97,12 @@ void   drawError(const String& msg);
 void   goToSleep(int seconds);
 bool   isLowFrequencyTime(const struct tm& t);
 int    sleepSeconds(const struct tm& t);
+const char* wakeCauseName(esp_sleep_wakeup_cause_t cause);
+void   logTm(const char* label, const struct tm& t);
+void   logClockState(const char* label);
+void   logGetLocalTimeResult(const char* label, bool ok, const struct tm* t);
+void   storeSleepSnapshot();
+void   printSleepSnapshot();
 
 // ──────────────────────────────────────────────────────
 //  setup() — entry point on every wake
@@ -88,43 +112,186 @@ void setup() {
   delay(300);
 
   bootCount++;
-  Serial.printf("Boot #%d\n", bootCount);
+  Serial.printf(
+    "Boot #%d wakeCause=%s(%d) firstBoot=%d ntpDay=%d\n",
+    bootCount,
+    wakeCauseName(esp_sleep_get_wakeup_cause()),
+    (int)esp_sleep_get_wakeup_cause(),
+    firstBoot,
+    ntpDay
+  );
+  printSleepSnapshot();
+  logClockState("boot/before applyTimeZone");
 
   epaper.begin();
   epaper.setRotation(0);
 
   // Restore timezone on every boot without restarting SNTP.
   applyTimeZone();
+  logClockState("boot/after applyTimeZone");
 
   struct tm t;
   bool haveTime = getLocalTime(&t);
+  logGetLocalTimeResult("boot/initial", haveTime, haveTime ? &t : nullptr);
   bool needNTP  = firstBoot || !haveTime || (haveTime && t.tm_yday != ntpDay);
+  Serial.printf(
+    "needNTP=%d (firstBoot=%d haveTime=%d tm_yday=%d ntpDay=%d)\n",
+    needNTP,
+    firstBoot,
+    haveTime,
+    haveTime ? t.tm_yday : -1,
+    ntpDay
+  );
 
   if (needNTP) {
     for (int attempt = 0; attempt < 3; attempt++) {
+      Serial.printf("NTP attempt %d/3\n", attempt + 1);
       ntpSync();
-      if (getLocalTime(&t)) break;
+      bool synced = getLocalTime(&t);
+      logGetLocalTimeResult("boot/post-ntp", synced, synced ? &t : nullptr);
+      logClockState("boot/post-ntp");
+      if (synced) break;
       delay(2000);
     }
     if (!getLocalTime(&t)) {
+      logClockState("boot/ntp-failed");
       drawError(String("NTP failed - retrying in ") + SLEEP_FAST_SEC + "s");
       goToSleep(SLEEP_FAST_SEC);
       return;
     }
     ntpDay = t.tm_yday;
+    Serial.printf("Updated ntpDay=%d\n", ntpDay);
   }
 
+  logTm("boot/final local", t);
+  int sleepSec = sleepSeconds(t);
+  Serial.printf("Scheduling deep sleep for %d seconds\n", sleepSec);
   drawTimeInWords(t, firstBoot);
   firstBoot = false;
 
-  goToSleep(sleepSeconds(t));
+  goToSleep(sleepSec);
 }
 
 void loop() {}
 
 void applyTimeZone() {
+  if (ENABLE_TIME_DEBUG) {
+    const char* oldTz = getenv("TZ");
+    Serial.printf(
+      "applyTimeZone: old TZ=%s requested TZ=%s\n",
+      oldTz ? oldTz : "(null)",
+      timeZone
+    );
+  }
   setenv("TZ", timeZone, 1);
   tzset();
+  if (ENABLE_TIME_DEBUG) {
+    const char* newTz = getenv("TZ");
+    Serial.printf("applyTimeZone: effective TZ=%s\n", newTz ? newTz : "(null)");
+  }
+}
+
+const char* wakeCauseName(esp_sleep_wakeup_cause_t cause) {
+  switch (cause) {
+    case ESP_SLEEP_WAKEUP_UNDEFINED: return "undefined";
+    case ESP_SLEEP_WAKEUP_EXT0:      return "ext0";
+    case ESP_SLEEP_WAKEUP_EXT1:      return "ext1";
+    case ESP_SLEEP_WAKEUP_TIMER:     return "timer";
+    case ESP_SLEEP_WAKEUP_TOUCHPAD:  return "touchpad";
+    case ESP_SLEEP_WAKEUP_ULP:       return "ulp";
+    case ESP_SLEEP_WAKEUP_GPIO:      return "gpio";
+    case ESP_SLEEP_WAKEUP_UART:      return "uart";
+    default:                         return "unknown";
+  }
+}
+
+void logTm(const char* label, const struct tm& t) {
+  if (!ENABLE_TIME_DEBUG) return;
+  Serial.printf(
+    "%s: %04d-%02d-%02d %02d:%02d:%02d yday=%d wday=%d isdst=%d\n",
+    label,
+    t.tm_year + 1900,
+    t.tm_mon + 1,
+    t.tm_mday,
+    t.tm_hour,
+    t.tm_min,
+    t.tm_sec,
+    t.tm_yday,
+    t.tm_wday,
+    t.tm_isdst
+  );
+}
+
+void logClockState(const char* label) {
+  if (!ENABLE_TIME_DEBUG) return;
+
+  time_t now = 0;
+  time(&now);
+
+  const char* tz = getenv("TZ");
+  Serial.printf("[%s] TZ=%s epoch=%lld\n", label, tz ? tz : "(null)", (long long)now);
+
+  struct tm localTm;
+  if (localtime_r(&now, &localTm)) {
+    logTm("  localtime_r", localTm);
+  } else {
+    Serial.println("  localtime_r failed");
+  }
+
+  struct tm utcTm;
+  if (gmtime_r(&now, &utcTm)) {
+    logTm("  gmtime_r", utcTm);
+  } else {
+    Serial.println("  gmtime_r failed");
+  }
+}
+
+void logGetLocalTimeResult(const char* label, bool ok, const struct tm* t) {
+  if (!ENABLE_TIME_DEBUG) return;
+  Serial.printf("%s: getLocalTime=%s\n", label, ok ? "ok" : "failed");
+  if (ok && t) logTm("  getLocalTime", *t);
+}
+
+void storeSleepSnapshot() {
+  if (!ENABLE_TIME_DEBUG) return;
+
+  time_t now = 0;
+  time(&now);
+
+  struct tm localTm = {};
+  struct tm utcTm   = {};
+  localtime_r(&now, &localTm);
+  gmtime_r(&now, &utcTm);
+
+  lastSleepSnapshot.epoch     = now;
+  lastSleepSnapshot.localYday = localTm.tm_yday;
+  lastSleepSnapshot.localHour = localTm.tm_hour;
+  lastSleepSnapshot.localMin  = localTm.tm_min;
+  lastSleepSnapshot.utcYday   = utcTm.tm_yday;
+  lastSleepSnapshot.utcHour   = utcTm.tm_hour;
+  lastSleepSnapshot.utcMin    = utcTm.tm_min;
+  lastSleepSnapshot.ntpDay    = ntpDay;
+  lastSleepSnapshot.bootCount = bootCount;
+  lastSleepSnapshot.firstBoot = firstBoot;
+  lastSleepSnapshotValid      = true;
+}
+
+void printSleepSnapshot() {
+  if (!ENABLE_TIME_DEBUG || !lastSleepSnapshotValid) return;
+
+  Serial.printf(
+    "Prev sleep snapshot: boot=%d epoch=%lld local=yday %d %02d:%02d utc=yday %d %02d:%02d ntpDay=%d firstBoot=%d\n",
+    lastSleepSnapshot.bootCount,
+    (long long)lastSleepSnapshot.epoch,
+    lastSleepSnapshot.localYday,
+    lastSleepSnapshot.localHour,
+    lastSleepSnapshot.localMin,
+    lastSleepSnapshot.utcYday,
+    lastSleepSnapshot.utcHour,
+    lastSleepSnapshot.utcMin,
+    lastSleepSnapshot.ntpDay,
+    lastSleepSnapshot.firstBoot
+  );
 }
 
 // ──────────────────────────────────────────────────────
@@ -146,16 +313,31 @@ int sleepSeconds(const struct tm& t) {
 // ──────────────────────────────────────────────────────
 void ntpSync() {
   Serial.println("NTP sync...");
+  logClockState("ntpSync/before WiFi");
   WiFi.begin(ssid, password);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < WIFI_TIMEOUT) { delay(500); tries++; }
+  Serial.printf("WiFi status=%d after %d waits\n", WiFi.status(), tries);
   if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Calling configTzTime(TZ=%s, server=%s)\n", timeZone, ntpServer);
     configTzTime(timeZone, ntpServer);
+    logClockState("ntpSync/after configTzTime");
     struct tm t;
+    bool gotTime = getLocalTime(&t);
     int ntpTries = 0;
-    while (!getLocalTime(&t) && ntpTries < 10) { delay(1000); ntpTries++; }
+    while (!gotTime && ntpTries < 10) {
+      ntpTries++;
+      Serial.printf("Waiting for NTP time... %d/10\n", ntpTries);
+      delay(1000);
+      gotTime = getLocalTime(&t);
+    }
+    logGetLocalTimeResult("ntpSync/final", gotTime, gotTime ? &t : nullptr);
+    logClockState("ntpSync/final");
   } else {
     Serial.println("WiFi failed — keeping previous time");
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    logClockState("ntpSync/WiFi-failed");
   }
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
@@ -301,40 +483,29 @@ void drawNikudMark(const String& mark, int cx, int yTop, int fontH, int scale) {
 // ──────────────────────────────────────────────────────
 int drawHebrewLine(const String& text, int cx, int y, int scale) {
   if (text.length() == 0) return 0;
+  HebrewToken tokens[64];
+  int n = tokenizeHebrew(text, tokens, 64);
 
-  // Split text into words (space-separated)
-  int wordCount = 0;
-  String words[8];
-  int start = 0;
-  for (int i = 0; i <= (int)text.length(); i++) {
-    if (i == (int)text.length() || text[i] == ' ') {
-      if (i > start && wordCount < 8) {
-        words[wordCount++] = text.substring(start, i);
-      }
-      start = i + 1;
-    }
-  }
-
-  epaper.setFreeFont(&Heebo_Bold_100);
+  epaper.setFreeFont(&Heebo_Bold_72);
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
   epaper.setTextSize(scale);
 
-  // Measure total width
   int totalW = 0;
-  for (int i = 0; i < wordCount; i++) {
-    totalW += epaper.textWidth(words[i].c_str());
-    if (i < wordCount - 1) totalW += HEBREW_SPACE_W;
+  for (int i = 0; i < n; i++) {
+    if (tokens[i].isSpace) totalW += HEBREW_SPACE_W;
+    else                   totalW += epaper.textWidth(tokens[i].letter.c_str());
   }
 
-  // Hebrew RTL: first word in source goes rightmost,
-  // so draw words in reverse order left-to-right.
-  int curX = cx - totalW / 2;
+  int curX  = cx - totalW / 2;
   int fontH = FONT_BASE_H * scale;
 
-  for (int i = wordCount - 1; i >= 0; i--) {
-    epaper.drawString(words[i].c_str(), curX, y);
-    curX += epaper.textWidth(words[i].c_str());
-    if (i > 0) curX += HEBREW_SPACE_W;
+  // Hebrew RTL: source[0] is rightmost on screen,
+  // iterate in reverse while drawing left-to-right.
+  for (int i = n - 1; i >= 0; i--) {
+    HebrewToken& t = tokens[i];
+    if (t.isSpace) { curX += HEBREW_SPACE_W; continue; }
+    epaper.drawString(t.letter.c_str(), curX, y);
+    curX += epaper.textWidth(t.letter.c_str());
   }
 
   epaper.setTextSize(1);
@@ -372,6 +543,12 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
 void drawTimeInWords(const struct tm& t, bool fullRefresh) {
   String line1, line2;
   splitTimePhrase(t, line1, line2);
+  Serial.printf(
+    "Drawing time hour=%d min=%d fullRefresh=%d\n",
+    t.tm_hour,
+    t.tm_min,
+    fullRefresh
+  );
 
   if (fullRefresh) epaper.fillScreen(TFT_WHITE);
   else             epaper.fillRect(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, TFT_WHITE);
@@ -410,6 +587,8 @@ void drawError(const String& msg) {
 void goToSleep(int seconds) {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  storeSleepSnapshot();
+  logClockState("before deep sleep");
   Serial.printf("Sleeping %d seconds...\n", seconds);
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
   esp_deep_sleep_start();

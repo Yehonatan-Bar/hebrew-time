@@ -19,6 +19,16 @@ def main():
     face = freetype.Face(ttf_path)
     face.set_pixel_sizes(0, size_px)
 
+    # For variable fonts, set weight to Bold (700)
+    try:
+        coords = freetype.FT_Fixed * 1
+        c = coords()
+        c[0] = freetype.FT_Fixed(int(700 * 65536))
+        freetype.FT_Set_Var_Design_Coordinates(face._FT_Face, 1, c)
+        print(f"  Variable font: weight set to 700 (Bold)")
+    except:
+        pass  # static font, ignore
+
     wanted = set()
     wanted.update(range(0x20, 0x7F))
     wanted.update(range(0x05B0, 0x05EB))
@@ -33,8 +43,7 @@ def main():
     for cp in range(first_code, last_code + 1):
         bit_offset = total_bits
         if cp in wanted:
-            # Use normal (grayscale) rendering for better quality
-            face.load_char(chr(cp), freetype.FT_LOAD_RENDER)
+            face.load_char(chr(cp), freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO)
             bmp = face.glyph.bitmap
             w = bmp.width
             h = bmp.rows
@@ -42,12 +51,12 @@ def main():
             xo = face.glyph.bitmap_left
             yo = -face.glyph.bitmap_top
 
-            # Convert grayscale to 1-bit with 50% threshold
             for row in range(h):
                 row_start = row * bmp.pitch
                 for col in range(w):
-                    gray = bmp.buffer[row_start + col]
-                    pixel = 1 if gray >= 128 else 0
+                    byte_idx = col >> 3
+                    bit_idx  = 7 - (col & 7)
+                    pixel = (bmp.buffer[row_start + byte_idx] >> bit_idx) & 1
 
                     bmp_byte = total_bits >> 3
                     bmp_bit  = 7 - (total_bits & 7)
