@@ -6,7 +6,7 @@
 // Update cadence:
 //   - Every 5 minutes during quiet hours
 //       (Sun-Thu 09:00-13:00, all days 00:00-06:00)
-//   - Every minute otherwise
+//   - Every 2 minutes otherwise
 //
 // SETUP NOTE — partial refresh:
 //   To enable partial-refresh updates, add this line to your library setup
@@ -17,52 +17,62 @@
 //   Without it, the call to epaper.updataPartial() below won't compile.
 //   (Yes, "updata" — that's the actual name in the library.)
 //
+#include "driver.h"
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <time.h>
 #include "esp_sleep.h"
-#include <Fonts/Custom/Hebrew_Bold_20.h>
+#include <Fonts/Custom/Heebo_Bold_100.h>
 #include "time_words.h"
+#include "secrets.h"
 
 #ifdef EPAPER_ENABLE
 
 EPaper epaper = EPaper();
 
 // ── Wi-Fi (used briefly for NTP sync, ~once per day) ──
-const char* ssid     = "*****";
-const char* password = "****";
+const char* ssid     = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 // ── NTP ───────────────────────────────────────────────
 const char* ntpServer          = "pool.ntp.org";
-const long  gmtOffset_sec      = 7200;    // GMT+2 (Israel)
-const int   daylightOffset_sec = 3600;    // +1 h DST
+const char* timeZone           = "UTC-6"; // POSIX TZ: "UTC-6" means UTC+6
 
 // ── Sleep / refresh schedule ──────────────────────────
-#define SLEEP_FAST_SEC   60
+#define SLEEP_FAST_SEC   120
 #define SLEEP_SLOW_SEC   300
 #define WIFI_TIMEOUT     20
 
 // ── Layout ────────────────────────────────────────────
 #define SCREEN_W         800
 #define SCREEN_H         480
-#define TEXT_SCALE       3                       // Hebrew_Bold_20 × 3 ≈ 60 px tall
-#define FONT_BASE_H      20                      // native height of Hebrew_Bold_20
-#define HEBREW_SPACE_W   (8 * TEXT_SCALE)
-#define LINE_GAP         (10 * TEXT_SCALE)
+#define TEXT_SCALE       1
+#define FONT_BASE_H      100
+#define HEBREW_SPACE_W   20
+#define LINE_GAP         24
 
 // Rectangle that gets cleared & redrawn (must satisfy 8-px X alignment for partial refresh)
 #define TIME_BOX_X       0
-#define TIME_BOX_Y       120
+#define TIME_BOX_Y       40
 #define TIME_BOX_W       800
-#define TIME_BOX_H       240
+#define TIME_BOX_H       400
 
 // ── State preserved across deep-sleep cycles ──────────
 RTC_DATA_ATTR int  ntpDay    = -1;
 RTC_DATA_ATTR int  bootCount = 0;
 RTC_DATA_ATTR bool firstBoot = true;
 
+// ── Types ─────────────────────────────────────────────
+struct HebrewToken {
+  String letter;        // one base letter, OR " " for a space
+  String marks[4];      // up to 4 niqud per base letter
+  int    markCount;
+  bool   isSpace;
+};
+
 // ── Forward declarations ──────────────────────────────
+void   applyTimeZone();
 void   ntpSync();
 void   drawTimeInWords(const struct tm& t, bool fullRefresh);
 void   drawError(const String& msg);
@@ -83,14 +93,21 @@ void setup() {
   epaper.begin();
   epaper.setRotation(0);
 
+  // Restore timezone on every boot without restarting SNTP.
+  applyTimeZone();
+
   struct tm t;
   bool haveTime = getLocalTime(&t);
   bool needNTP  = firstBoot || !haveTime || (haveTime && t.tm_yday != ntpDay);
 
   if (needNTP) {
-    ntpSync();
+    for (int attempt = 0; attempt < 3; attempt++) {
+      ntpSync();
+      if (getLocalTime(&t)) break;
+      delay(2000);
+    }
     if (!getLocalTime(&t)) {
-      drawError("Time Error");
+      drawError(String("NTP failed - retrying in ") + SLEEP_FAST_SEC + "s");
       goToSleep(SLEEP_FAST_SEC);
       return;
     }
@@ -104,6 +121,11 @@ void setup() {
 }
 
 void loop() {}
+
+void applyTimeZone() {
+  setenv("TZ", timeZone, 1);
+  tzset();
+}
 
 // ──────────────────────────────────────────────────────
 //  Sleep mode logic
@@ -128,8 +150,10 @@ void ntpSync() {
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < WIFI_TIMEOUT) { delay(500); tries++; }
   if (WiFi.status() == WL_CONNECTED) {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    delay(1500);
+    configTzTime(timeZone, ntpServer);
+    struct tm t;
+    int ntpTries = 0;
+    while (!getLocalTime(&t) && ntpTries < 10) { delay(1000); ntpTries++; }
   } else {
     Serial.println("WiFi failed — keeping previous time");
   }
@@ -141,13 +165,6 @@ void ntpSync() {
 //  Hebrew tokenizer — groups each base letter with the
 //  niqud (combining marks) that follow it in source order.
 // ──────────────────────────────────────────────────────
-struct HebrewToken {
-  String letter;        // one base letter, OR " " for a space
-  String marks[4];      // up to 4 niqud per base letter
-  int    markCount;
-  bool   isSpace;
-};
-
 bool isHebrewNikudUtf8(uint8_t b0, uint8_t b1) {
   // U+05B0..U+05BD  → 0xD6 0xB0..0xBD  (sheva, hatafs, vowels, dagesh, meteg)
   // U+05BF          → 0xD6 0xBF        (rafe)
@@ -207,71 +224,75 @@ void drawNikudMark(const String& mark, int cx, int yTop, int fontH, int scale) {
   uint16_t cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
 
   int baseline = yTop + fontH;
-  int dotR     = scale;
-  int gap      = 3 * scale;       // distance between letter and niqud
+  int dotR     = max(2, fontH / 20);
+  int gap      = fontH / 8;
+
+  int sp = dotR * 3;  // spacing between dots
+  int lineW = fontH / 4;
+  int lineH = max(2, fontH / 30);
 
   switch (cp) {
     case 0x05B0:  // sheva — two vertical dots below
-      epaper.fillCircle(cx, baseline + gap,             dotR, TFT_BLACK);
-      epaper.fillCircle(cx, baseline + gap + 4*scale,   dotR, TFT_BLACK);
+      epaper.fillCircle(cx, baseline + gap,        dotR, TFT_BLACK);
+      epaper.fillCircle(cx, baseline + gap + sp,   dotR, TFT_BLACK);
       break;
     case 0x05B1:  // hataf segol = sheva + segol
-      epaper.fillCircle(cx + 4*scale, baseline + gap,           dotR, TFT_BLACK);
-      epaper.fillCircle(cx + 4*scale, baseline + gap + 4*scale, dotR, TFT_BLACK);
-      epaper.fillCircle(cx - 3*scale, baseline + gap,           dotR, TFT_BLACK);
-      epaper.fillCircle(cx - 8*scale, baseline + gap,           dotR, TFT_BLACK);
-      epaper.fillCircle(cx - 5*scale, baseline + gap + 4*scale, dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap + sp,   dotR, TFT_BLACK);
+      epaper.fillCircle(cx - sp/2, baseline + gap,      dotR, TFT_BLACK);
+      epaper.fillCircle(cx - sp*2, baseline + gap,      dotR, TFT_BLACK);
+      epaper.fillCircle(cx - sp,   baseline + gap + sp, dotR, TFT_BLACK);
       break;
     case 0x05B2:  // hataf patah = sheva + patah line
-      epaper.fillCircle(cx + 4*scale, baseline + gap,             dotR, TFT_BLACK);
-      epaper.fillCircle(cx + 4*scale, baseline + gap + 4*scale,   dotR, TFT_BLACK);
-      epaper.fillRect  (cx - 9*scale, baseline + gap + 2*scale,   6*scale, scale, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap + sp,   dotR, TFT_BLACK);
+      epaper.fillRect(cx - lineW - sp, baseline + gap + sp/2, lineW, lineH, TFT_BLACK);
       break;
     case 0x05B3:  // hataf qamatz = sheva + qamatz
-      epaper.fillCircle(cx + 4*scale, baseline + gap,             dotR, TFT_BLACK);
-      epaper.fillCircle(cx + 4*scale, baseline + gap + 4*scale,   dotR, TFT_BLACK);
-      epaper.fillRect  (cx - 9*scale, baseline + gap + scale,     6*scale, scale,   TFT_BLACK);
-      epaper.fillRect  (cx - 7*scale, baseline + gap + 2*scale,   scale,   3*scale, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap + sp,   dotR, TFT_BLACK);
+      epaper.fillRect(cx - lineW - sp, baseline + gap + sp/2,     lineW, lineH,  TFT_BLACK);
+      epaper.fillRect(cx - sp - lineW/2, baseline + gap + sp/2,   lineH, sp,     TFT_BLACK);
       break;
     case 0x05B4:  // hiriq — single dot below
-      epaper.fillCircle(cx, baseline + gap + 2*scale, dotR, TFT_BLACK);
+      epaper.fillCircle(cx, baseline + gap + sp/2, dotR, TFT_BLACK);
       break;
     case 0x05B5:  // tsere — two horizontal dots below
-      epaper.fillCircle(cx - 4*scale, baseline + gap + 2*scale, dotR, TFT_BLACK);
-      epaper.fillCircle(cx + 4*scale, baseline + gap + 2*scale, dotR, TFT_BLACK);
+      epaper.fillCircle(cx - sp, baseline + gap + sp/2, dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap + sp/2, dotR, TFT_BLACK);
       break;
     case 0x05B6:  // segol — three dots in inverted triangle below
-      epaper.fillCircle(cx - 4*scale, baseline + gap,             dotR, TFT_BLACK);
-      epaper.fillCircle(cx + 4*scale, baseline + gap,             dotR, TFT_BLACK);
-      epaper.fillCircle(cx,           baseline + gap + 4*scale,   dotR, TFT_BLACK);
+      epaper.fillCircle(cx - sp, baseline + gap,        dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
+      epaper.fillCircle(cx,      baseline + gap + sp,   dotR, TFT_BLACK);
       break;
     case 0x05B7:  // patah — horizontal line below
-      epaper.fillRect(cx - 5*scale, baseline + gap + 2*scale, 10*scale, scale, TFT_BLACK);
+      epaper.fillRect(cx - lineW/2, baseline + gap + sp/2, lineW, lineH, TFT_BLACK);
       break;
     case 0x05B8:  // qamatz — T-shape below (line + small vertical)
     case 0x05C7:  // qamatz qatan
-      epaper.fillRect(cx - 5*scale, baseline + gap + scale,     10*scale, scale,   TFT_BLACK);
-      epaper.fillRect(cx - scale/2, baseline + gap + 2*scale,   scale,    3*scale, TFT_BLACK);
+      epaper.fillRect(cx - lineW/2, baseline + gap + sp/2,        lineW, lineH, TFT_BLACK);
+      epaper.fillRect(cx - lineH/2, baseline + gap + sp/2 + lineH, lineH, sp,  TFT_BLACK);
       break;
     case 0x05B9:  // holam — dot above
     case 0x05BA:  // holam haser
       epaper.fillCircle(cx, yTop - gap, dotR, TFT_BLACK);
       break;
     case 0x05BB:  // qubuts — three diagonal dots below
-      epaper.fillCircle(cx - 4*scale, baseline + gap,             dotR, TFT_BLACK);
-      epaper.fillCircle(cx,           baseline + gap + 2*scale,   dotR, TFT_BLACK);
-      epaper.fillCircle(cx + 4*scale, baseline + gap + 4*scale,   dotR, TFT_BLACK);
+      epaper.fillCircle(cx - sp, baseline + gap,          dotR, TFT_BLACK);
+      epaper.fillCircle(cx,      baseline + gap + sp/2,   dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp, baseline + gap + sp,     dotR, TFT_BLACK);
       break;
     case 0x05BC:  // dagesh / mappiq — dot inside letter
       epaper.fillCircle(cx, yTop + fontH/2, dotR, TFT_BLACK);
       break;
     case 0x05C1:  // shin dot — above-right
-      epaper.fillCircle(cx + 6*scale, yTop - gap, dotR, TFT_BLACK);
+      epaper.fillCircle(cx + sp*2, yTop - gap, dotR, TFT_BLACK);
       break;
     case 0x05C2:  // sin dot — above-left
-      epaper.fillCircle(cx - 6*scale, yTop - gap, dotR, TFT_BLACK);
+      epaper.fillCircle(cx - sp*2, yTop - gap, dotR, TFT_BLACK);
       break;
-    default: break;  // meteg, rafe, others — skipped
+    default: break;
   }
 }
 
@@ -280,39 +301,45 @@ void drawNikudMark(const String& mark, int cx, int yTop, int fontH, int scale) {
 // ──────────────────────────────────────────────────────
 int drawHebrewLine(const String& text, int cx, int y, int scale) {
   if (text.length() == 0) return 0;
-  HebrewToken tokens[64];
-  int n = tokenizeHebrew(text, tokens, 64);
 
-  epaper.setFreeFont(&Hebrew_Bold_20);
+  // Split text into words (space-separated)
+  int wordCount = 0;
+  String words[8];
+  int start = 0;
+  for (int i = 0; i <= (int)text.length(); i++) {
+    if (i == (int)text.length() || text[i] == ' ') {
+      if (i > start && wordCount < 8) {
+        words[wordCount++] = text.substring(start, i);
+      }
+      start = i + 1;
+    }
+  }
+
+  epaper.setFreeFont(&Heebo_Bold_100);
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
   epaper.setTextSize(scale);
 
+  // Measure total width
   int totalW = 0;
-  for (int i = 0; i < n; i++) {
-    if (tokens[i].isSpace) totalW += HEBREW_SPACE_W;
-    else                   totalW += epaper.textWidth(tokens[i].letter.c_str());
+  for (int i = 0; i < wordCount; i++) {
+    totalW += epaper.textWidth(words[i].c_str());
+    if (i < wordCount - 1) totalW += HEBREW_SPACE_W;
   }
 
-  int curX  = cx - totalW / 2;
+  // Hebrew RTL: first word in source goes rightmost,
+  // so draw words in reverse order left-to-right.
+  int curX = cx - totalW / 2;
   int fontH = FONT_BASE_H * scale;
 
-  // Hebrew is right-to-left: source[0] should appear rightmost on screen,
-  // so iterate tokens in reverse order while drawing left-to-right.
-  for (int i = n - 1; i >= 0; i--) {
-    HebrewToken& t = tokens[i];
-    if (t.isSpace) { curX += HEBREW_SPACE_W; continue; }
-    int w = epaper.textWidth(t.letter.c_str());
-    epaper.drawString(t.letter.c_str(), curX, y);
-    int letterCx = curX + w / 2;
-    for (int m = 0; m < t.markCount; m++) {
-      drawNikudMark(t.marks[m], letterCx, y, fontH, scale);
-    }
-    curX += w;
+  for (int i = wordCount - 1; i >= 0; i--) {
+    epaper.drawString(words[i].c_str(), curX, y);
+    curX += epaper.textWidth(words[i].c_str());
+    if (i > 0) curX += HEBREW_SPACE_W;
   }
 
   epaper.setTextSize(1);
   epaper.setTextFont(0);
-  return fontH + 8 * scale;
+  return fontH;
 }
 
 // ──────────────────────────────────────────────────────

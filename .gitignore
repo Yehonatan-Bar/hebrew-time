@@ -49,3 +49,6 @@ dist/
 *.elf
 *.bin
 *.hex
+
+# Arduino secrets — never commit real credentials
+secrets.h
