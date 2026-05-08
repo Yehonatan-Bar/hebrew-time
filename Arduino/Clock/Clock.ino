@@ -487,14 +487,17 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
   int n = tokenizeHebrew(text, tokens, 64);
 
   epaper.setFreeFont(&Heebo_Bold_72);
-  epaper.setTextColor(TFT_BLACK, TFT_WHITE);
+  epaper.setTextColor(TFT_BLACK);
   epaper.setTextSize(scale);
 
+  int letterGap = 3;
   int totalW = 0;
+  int letterCount = 0;
   for (int i = 0; i < n; i++) {
     if (tokens[i].isSpace) totalW += HEBREW_SPACE_W;
-    else                   totalW += epaper.textWidth(tokens[i].letter.c_str());
+    else { totalW += epaper.textWidth(tokens[i].letter.c_str()); letterCount++; }
   }
+  totalW += (letterCount - 1) * letterGap;
 
   int curX  = cx - totalW / 2;
   int fontH = FONT_BASE_H * scale;
@@ -505,7 +508,7 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
     HebrewToken& t = tokens[i];
     if (t.isSpace) { curX += HEBREW_SPACE_W; continue; }
     epaper.drawString(t.letter.c_str(), curX, y);
-    curX += epaper.textWidth(t.letter.c_str());
+    curX += epaper.textWidth(t.letter.c_str()) + letterGap;
   }
 
   epaper.setTextSize(1);
@@ -575,7 +578,7 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
 // ──────────────────────────────────────────────────────
 void drawError(const String& msg) {
   epaper.fillScreen(TFT_WHITE);
-  epaper.setTextColor(TFT_BLACK, TFT_WHITE);
+  epaper.setTextColor(TFT_BLACK);
   epaper.drawCentreString("Error:",      SCREEN_W/2, SCREEN_H/2 - 30, 4);
   epaper.drawCentreString(msg.c_str(),   SCREEN_W/2, SCREEN_H/2 + 10, 2);
   epaper.update();
