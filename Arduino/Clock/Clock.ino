@@ -24,7 +24,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include "esp_sleep.h"
-#include <Fonts/Custom/Heebo_Bold_72.h>
+#include <Fonts/Custom/Heebo_Bold_85.h>
 #include "time_words.h"
 #include "secrets.h"
 
@@ -50,7 +50,7 @@ const bool  ENABLE_TIME_DEBUG  = true;
 #define SCREEN_W         800
 #define SCREEN_H         480
 #define TEXT_SCALE       1
-#define FONT_BASE_H      72
+#define FONT_BASE_H      85
 #define HEBREW_SPACE_W   20
 #define LINE_GAP         24
 
@@ -486,11 +486,11 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
   HebrewToken tokens[64];
   int n = tokenizeHebrew(text, tokens, 64);
 
-  epaper.setFreeFont(&Heebo_Bold_72);
+  epaper.setFreeFont(&Heebo_Bold_85);
   epaper.setTextColor(TFT_BLACK);
   epaper.setTextSize(scale);
 
-  int letterGap = 3;
+  int letterGap = 5;
   int totalW = 0;
   int letterCount = 0;
   for (int i = 0; i < n; i++) {

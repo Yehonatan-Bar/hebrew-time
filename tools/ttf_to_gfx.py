@@ -4,7 +4,7 @@ Usage:
     python ttf_to_gfx.py <font.ttf> <size_px> <output.h> <font_name>
 
 Generates glyphs for ASCII 0x20-0x7E and Hebrew 0x05B0-0x05EA.
-Uses grayscale rendering with threshold for cleaner 1-bit output.
+Each glyph bitmap is padded to byte boundary (GFXfont requirement).
 """
 
 import sys
@@ -19,7 +19,6 @@ def main():
     face = freetype.Face(ttf_path)
     face.set_pixel_sizes(0, size_px)
 
-    # For variable fonts, set weight to Bold (700)
     try:
         coords = freetype.FT_Fixed * 1
         c = coords()
@@ -27,7 +26,7 @@ def main():
         freetype.FT_Set_Var_Design_Coordinates(face._FT_Face, 1, c)
         print(f"  Variable font: weight set to 700 (Bold)")
     except:
-        pass  # static font, ignore
+        pass
 
     wanted = set()
     wanted.update(range(0x20, 0x7F))
@@ -38,10 +37,9 @@ def main():
 
     bitmaps = bytearray()
     glyphs  = []
-    total_bits = 0
 
     for cp in range(first_code, last_code + 1):
-        bit_offset = total_bits
+        byte_offset = len(bitmaps)
         if cp in wanted:
             face.load_char(chr(cp), freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO)
             bmp = face.glyph.bitmap
@@ -51,28 +49,30 @@ def main():
             xo = face.glyph.bitmap_left
             yo = -face.glyph.bitmap_top
 
+            # Pack w*h bits, then pad to next byte boundary
+            bit_count = 0
             for row in range(h):
                 row_start = row * bmp.pitch
                 for col in range(w):
-                    byte_idx = col >> 3
-                    bit_idx  = 7 - (col & 7)
-                    pixel = (bmp.buffer[row_start + byte_idx] >> bit_idx) & 1
+                    src_byte = col >> 3
+                    src_bit  = 7 - (col & 7)
+                    pixel = (bmp.buffer[row_start + src_byte] >> src_bit) & 1
 
-                    bmp_byte = total_bits >> 3
-                    bmp_bit  = 7 - (total_bits & 7)
-                    while len(bitmaps) <= bmp_byte:
+                    dst_bit = 7 - (bit_count & 7)
+                    if dst_bit == 7:
                         bitmaps.append(0)
                     if pixel:
-                        bitmaps[bmp_byte] |= (1 << bmp_bit)
-                    total_bits += 1
+                        bitmaps[-1] |= (1 << dst_bit)
+                    bit_count += 1
+
+            # Pad remaining bits in last byte (already zeros)
+            # Just ensure we ended a byte
+            if bit_count & 7:
+                pass  # last byte already appended, partial bits are zero-filled
         else:
             w, h, xa, xo, yo = 0, 0, 0, 0, 0
 
-        byte_offset = bit_offset >> 3
         glyphs.append((byte_offset, w, h, xa, xo, yo))
-
-    while len(bitmaps) <= (total_bits >> 3):
-        bitmaps.append(0)
 
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(f"// {font_name} — auto-generated from {ttf_path.split('/')[-1].split(chr(92))[-1]}, {size_px}px\n")
