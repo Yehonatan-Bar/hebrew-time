@@ -6,7 +6,7 @@
 // Update cadence:
 //   - Every 5 minutes during quiet hours
 //       (Sun-Thu 09:00-13:00, all days 00:00-06:00)
-//   - Every 2 minutes otherwise
+//   - Every 30 seconds otherwise
 //
 // SETUP NOTE — partial refresh:
 //   To enable partial-refresh updates, add this line to your library setup
@@ -24,7 +24,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include "esp_sleep.h"
-#include <Fonts/Custom/Heebo_Bold_85.h>
+#include <Fonts/Custom/NotoSerifHebrew_Bold_85.h>
 #include "time_words.h"
 #include "secrets.h"
 
@@ -42,7 +42,7 @@ const char* timeZone           = "IST-2IDT,M3.4.4/26,M10.5.0"; // Israel: UTC+2 
 const bool  ENABLE_TIME_DEBUG  = true;
 
 // ── Sleep / refresh schedule ──────────────────────────
-#define SLEEP_FAST_SEC   120
+#define SLEEP_FAST_SEC   30
 #define SLEEP_SLOW_SEC   300
 #define WIFI_TIMEOUT     20
 
@@ -388,7 +388,7 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
   for (int i = 0; i < wordCount; i++)
     reversed[i] = reverseHebrew(words[i]);
 
-  epaper.setFreeFont(&Heebo_Bold_85);
+  epaper.setFreeFont(&NotoSerifHebrew_Bold_85);
   epaper.setTextColor(TFT_BLACK);
   epaper.setTextSize(scale);
 
