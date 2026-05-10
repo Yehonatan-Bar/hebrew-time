@@ -42,7 +42,7 @@ const char* timeZone           = "IST-2IDT,M3.4.4/26,M10.5.0"; // Israel: UTC+2 
 const bool  ENABLE_TIME_DEBUG  = true;
 
 // ── Sleep / refresh schedule ──────────────────────────
-#define SLEEP_FAST_SEC   30
+#define SLEEP_FAST_SEC   120
 #define SLEEP_SLOW_SEC   300
 #define WIFI_TIMEOUT     20
 
@@ -518,11 +518,22 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
 // ──────────────────────────────────────────────────────
 //  Build the two-line phrase for the current time
 // ──────────────────────────────────────────────────────
-void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
+static int countWords(const String& s) {
+  int n = 0;
+  bool inWord = false;
+  for (int i = 0; i < (int)s.length(); i++) {
+    if (s[i] == ' ') { inWord = false; }
+    else if (!inWord) { inWord = true; n++; }
+  }
+  return n;
+}
+
+void splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3) {
   int hour12 = t.tm_hour % 12;
   if (hour12 == 0) hour12 = 12;
   int min = t.tm_min;
   String period = String(getTimePeriod(t.tm_hour));
+  line3 = "";
 
   if (isSubtractMinute(min)) {
     int next = (hour12 % 12) + 1;       // 12 -> 1
@@ -532,8 +543,15 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
     line1 = String(HOURS[hour12 - 1]);
     line2 = period;
   } else {
-    line1 = String(HOURS[hour12 - 1]) + " " + String(MINUTE_PREFIX[min]);
-    line2 = period;
+    String minPart = String(MINUTE_PREFIX[min]);
+    if (countWords(minPart) == 3) {
+      line1 = String(HOURS[hour12 - 1]);
+      line2 = minPart;
+      line3 = period;
+    } else {
+      line1 = String(HOURS[hour12 - 1]) + " " + minPart;
+      line2 = period;
+    }
   }
 }
 
@@ -544,8 +562,8 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
 //  redraw only the time box and use partial refresh.
 // ──────────────────────────────────────────────────────
 void drawTimeInWords(const struct tm& t, bool fullRefresh) {
-  String line1, line2;
-  splitTimePhrase(t, line1, line2);
+  String line1, line2, line3;
+  splitTimePhrase(t, line1, line2, line3);
   Serial.printf(
     "Drawing time hour=%d min=%d fullRefresh=%d\n",
     t.tm_hour,
@@ -558,18 +576,22 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
 
   int cx     = SCREEN_W / 2;
   int fontH  = FONT_BASE_H * TEXT_SCALE;
-  int totalH = 2 * fontH + LINE_GAP;
+  int numLines = (line3.length() > 0) ? 3 : 2;
+  int totalH = numLines * fontH + (numLines - 1) * LINE_GAP;
   int y      = TIME_BOX_Y + (TIME_BOX_H - totalH) / 2;
 
   drawHebrewLine(line1, cx, y, TEXT_SCALE);
   drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
+  if (numLines == 3) {
+    drawHebrewLine(line3, cx, y + 2 * (fontH + LINE_GAP), TEXT_SCALE);
+  }
 
   if (fullRefresh) {
     epaper.update();
   } else {
     epaper.updataPartial(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
   }
-  Serial.printf("Drew \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str());
+  Serial.printf("Drew \"%s\" / \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str(), line3.c_str());
 }
 
 // ──────────────────────────────────────────────────────

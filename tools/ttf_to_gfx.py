@@ -35,13 +35,13 @@ def main():
         c = coords()
         for i, tag in enumerate(axis_tags):
             if tag == 'wght':
-                c[i] = freetype.FT_Fixed(int(700 * 65536))
+                c[i] = freetype.FT_Fixed(int(500 * 65536))
             elif tag == 'wdth':
                 c[i] = freetype.FT_Fixed(int(100 * 65536))
             else:
                 c[i] = freetype.FT_Fixed(int(master_ptr.contents.axis[i].minimum))
         freetype.FT_Set_Var_Design_Coordinates(face._FT_Face, num_axes, c)
-        print(f"  Variable font: wght=700 (Bold), wdth=100")
+        print(f"  Variable font: wght=500 (Medium), wdth=100")
     except Exception as e:
         try:
             coords = freetype.FT_Fixed * 1
