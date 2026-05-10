@@ -3,10 +3,7 @@
 // Displays the current time in Hebrew words
 // on a 7.5" e-ink display (Seeed XIAO e-paper driver, model 502).
 //
-// Update cadence:
-//   - Every 5 minutes during quiet hours
-//       (Sun-Thu 09:00-13:00, all days 00:00-06:00)
-//   - Every 30 seconds otherwise
+// Update cadence: every 2 minutes
 //
 // SETUP NOTE — partial refresh:
 //   To enable partial-refresh updates, add this line to your library setup
@@ -22,6 +19,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <time.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include "esp_sleep.h"
 #include <Fonts/Custom/NotoSerifHebrew_Bold_85.h>
@@ -45,6 +43,7 @@ const bool  ENABLE_TIME_DEBUG  = true;
 #define SLEEP_FAST_SEC   120
 #define SLEEP_SLOW_SEC   300
 #define WIFI_TIMEOUT     20
+#define TIME_OFFSET_SEC  60
 
 // ── Layout ────────────────────────────────────────────
 #define SCREEN_W         800
@@ -53,17 +52,21 @@ const bool  ENABLE_TIME_DEBUG  = true;
 #define FONT_BASE_H      85
 #define HEBREW_SPACE_W   20
 #define LINE_GAP         24
+#define FONT_ASCENT      55
+#define FONT_DESCENT      7
 
 // Rectangle that gets cleared & redrawn (must satisfy 8-px X alignment for partial refresh)
 #define TIME_BOX_X       0
-#define TIME_BOX_Y       80
+#define TIME_BOX_Y       70
 #define TIME_BOX_W       800
 #define TIME_BOX_H       400
 
 // ── State preserved across deep-sleep cycles ──────────
-RTC_DATA_ATTR int  ntpDay    = -1;
-RTC_DATA_ATTR int  bootCount = 0;
-RTC_DATA_ATTR bool firstBoot = true;
+RTC_DATA_ATTR int    ntpDay    = -1;
+RTC_DATA_ATTR int    bootCount = 0;
+RTC_DATA_ATTR bool   firstBoot = true;
+RTC_DATA_ATTR time_t savedEpoch = 0;
+RTC_DATA_ATTR int    savedSleepSec = 0;
 
 struct TimeDebugSnapshot {
   time_t epoch;
@@ -94,7 +97,7 @@ struct GlyphMetrics {
 void   applyTimeZone();
 void   ntpSync();
 void   drawTimeInWords(const struct tm& t, bool fullRefresh);
-void   splitTimePhrase(const struct tm& t, String& line1, String& line2);
+void   splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3);
 void   drawError(const String& msg);
 void   goToSleep(int seconds);
 bool   isLowFrequencyTime(const struct tm& t);
@@ -130,6 +133,15 @@ void setup() {
 
   // Restore timezone on every boot without restarting SNTP.
   applyTimeZone();
+
+  // Restore system clock from RTC memory so we don't need NTP every boot.
+  if (savedEpoch > 0 && !firstBoot) {
+    time_t restored = savedEpoch + savedSleepSec;
+    struct timeval tv = { .tv_sec = restored, .tv_usec = 0 };
+    settimeofday(&tv, nullptr);
+    Serial.printf("Restored time from RTC memory: epoch=%lld + sleep=%d\n",
+                  (long long)savedEpoch, savedSleepSec);
+  }
   logClockState("boot/after applyTimeZone");
 
   struct tm t;
@@ -164,6 +176,10 @@ void setup() {
     ntpDay = t.tm_yday;
     Serial.printf("Updated ntpDay=%d\n", ntpDay);
   }
+
+  // Apply manual time offset
+  time_t adjusted = mktime(&t) + TIME_OFFSET_SEC;
+  localtime_r(&adjusted, &t);
 
   logTm("boot/final local", t);
   int sleepSec = sleepSeconds(t);
@@ -306,8 +322,15 @@ bool isLowFrequencyTime(const struct tm& t) {
   return false;
 }
 
+bool isSpecialMinute(int m) {
+  return m == 0 || m == 5 || m == 10 || m == 15 || m == 30 ||
+         m == 40 || m == 45 || m == 50 || m == 55;
+}
+
 int sleepSeconds(const struct tm& t) {
-  return isLowFrequencyTime(t) ? SLEEP_SLOW_SEC : SLEEP_FAST_SEC;
+  int nextMin = (t.tm_min + 1) % 60;
+  if (isSpecialMinute(nextMin)) return 60;
+  return SLEEP_FAST_SEC;
 }
 
 // ──────────────────────────────────────────────────────
@@ -544,7 +567,7 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2, String& l
     line2 = period;
   } else {
     String minPart = String(MINUTE_PREFIX[min]);
-    if (countWords(minPart) == 3) {
+    if (hour12 >= 11 || countWords(minPart) == 3) {
       line1 = String(HOURS[hour12 - 1]);
       line2 = minPart;
       line3 = period;
@@ -577,8 +600,8 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
   int cx     = SCREEN_W / 2;
   int fontH  = FONT_BASE_H * TEXT_SCALE;
   int numLines = (line3.length() > 0) ? 3 : 2;
-  int totalH = numLines * fontH + (numLines - 1) * LINE_GAP;
-  int y      = TIME_BOX_Y + (TIME_BOX_H - totalH) / 2;
+  int visH   = FONT_ASCENT + (numLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
+  int y      = TIME_BOX_Y + (TIME_BOX_H - visH) / 2 + FONT_ASCENT;
 
   drawHebrewLine(line1, cx, y, TEXT_SCALE);
   drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
@@ -611,6 +634,8 @@ void drawError(const String& msg) {
 void goToSleep(int seconds) {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  time(&savedEpoch);
+  savedSleepSec = seconds;
   storeSleepSnapshot();
   logClockState("before deep sleep");
   Serial.printf("Sleeping %d seconds...\n", seconds);
