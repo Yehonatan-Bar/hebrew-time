@@ -20,13 +20,37 @@ def main():
     face.set_pixel_sizes(0, size_px)
 
     try:
-        coords = freetype.FT_Fixed * 1
+        import ctypes
+        master_ptr = ctypes.POINTER(freetype.FT_MM_Var)()
+        freetype.FT_Get_MM_Var(face._FT_Face, ctypes.byref(master_ptr))
+        num_axes = master_ptr.contents.num_axis
+        axis_tags = []
+        for i in range(num_axes):
+            tag = master_ptr.contents.axis[i].tag
+            tag_str = ''.join(chr((tag >> (8*(3-j))) & 0xFF) for j in range(4))
+            axis_tags.append(tag_str)
+        print(f"  Variable font axes: {axis_tags}")
+
+        coords = freetype.FT_Fixed * num_axes
         c = coords()
-        c[0] = freetype.FT_Fixed(int(700 * 65536))
-        freetype.FT_Set_Var_Design_Coordinates(face._FT_Face, 1, c)
-        print(f"  Variable font: weight set to 700 (Bold)")
-    except:
-        pass
+        for i, tag in enumerate(axis_tags):
+            if tag == 'wght':
+                c[i] = freetype.FT_Fixed(int(700 * 65536))
+            elif tag == 'wdth':
+                c[i] = freetype.FT_Fixed(int(100 * 65536))
+            else:
+                c[i] = freetype.FT_Fixed(int(master_ptr.contents.axis[i].minimum))
+        freetype.FT_Set_Var_Design_Coordinates(face._FT_Face, num_axes, c)
+        print(f"  Variable font: wght=700 (Bold), wdth=100")
+    except Exception as e:
+        try:
+            coords = freetype.FT_Fixed * 1
+            c = coords()
+            c[0] = freetype.FT_Fixed(int(700 * 65536))
+            freetype.FT_Set_Var_Design_Coordinates(face._FT_Face, 1, c)
+            print(f"  Variable font: weight set to 700 (Bold)")
+        except:
+            pass
 
     wanted = set()
     wanted.update(range(0x20, 0x7F))

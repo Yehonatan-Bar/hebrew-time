@@ -81,13 +81,20 @@ struct TimeDebugSnapshot {
 RTC_DATA_ATTR TimeDebugSnapshot lastSleepSnapshot;
 RTC_DATA_ATTR bool              lastSleepSnapshotValid = false;
 
-// ── Forward: Hebrew RTL helper ────────────────────────
+// ── Types used by Hebrew RTL + niqud rendering ───────
+struct GlyphMetrics {
+  uint8_t  width;
+  uint8_t  height;
+  uint8_t  xAdvance;
+  int8_t   xOffset;
+  int8_t   yOffset;
+};
 
 // ── Forward declarations ──────────────────────────────
 void   applyTimeZone();
 void   ntpSync();
 void   drawTimeInWords(const struct tm& t, bool fullRefresh);
-void   splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3);
+void   splitTimePhrase(const struct tm& t, String& line1, String& line2);
 void   drawError(const String& msg);
 void   goToSleep(int seconds);
 bool   isLowFrequencyTime(const struct tm& t);
@@ -339,27 +346,129 @@ void ntpSync() {
 }
 
 // ──────────────────────────────────────────────────────
-//  Hebrew RTL support.
-//  GFXfont draws characters LTR. To display Hebrew we
-//  reverse each word so drawString() renders it correctly.
+//  Hebrew RTL + niqud support.
+//  GFXfont can't position combining marks (niqud) correctly
+//  because it lacks OpenType GPOS support. We draw glyphs
+//  individually and center each niqud mark on its base letter.
 // ──────────────────────────────────────────────────────
+bool isNiqudCP(uint16_t cp) {
+  return (cp >= 0x05B0 && cp <= 0x05BD) || cp == 0x05BF ||
+         cp == 0x05C1 || cp == 0x05C2 || cp == 0x05C7;
+}
+
+bool isNikudByte(uint8_t b0, uint8_t b1) {
+  uint16_t cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+  return isNiqudCP(cp);
+}
+
+uint16_t decodeUTF8(const String& s, int& pos) {
+  uint8_t b0 = (uint8_t)s[pos];
+  if ((b0 & 0xE0) == 0xC0 && pos + 1 < (int)s.length()) {
+    uint8_t b1 = (uint8_t)s[pos + 1];
+    pos += 2;
+    return ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+  }
+  pos++;
+  return b0;
+}
+
+void drawGlyphBitmap(const GFXfont* font, uint16_t cp, int x, int y) {
+  if (cp < pgm_read_word(&font->first) || cp > pgm_read_word(&font->last)) return;
+  const GFXglyph* glyph = &((const GFXglyph*)pgm_read_ptr(&font->glyph))[cp - pgm_read_word(&font->first)];
+  const uint8_t* bitmap = (const uint8_t*)pgm_read_ptr(&font->bitmap);
+
+  uint32_t bo = pgm_read_dword(&glyph->bitmapOffset);
+  uint8_t  w  = pgm_read_byte(&glyph->width);
+  uint8_t  h  = pgm_read_byte(&glyph->height);
+
+  int bit = 0;
+  for (int row = 0; row < h; row++) {
+    for (int col = 0; col < w; col++) {
+      if (pgm_read_byte(&bitmap[bo + bit / 8]) & (0x80 >> (bit & 7)))
+        epaper.drawPixel(x + col, y + row, TFT_BLACK);
+      bit++;
+    }
+  }
+}
+
+GlyphMetrics getGlyphMetrics(const GFXfont* font, uint16_t cp) {
+  GlyphMetrics m = {0, 0, 0, 0, 0};
+  if (cp < pgm_read_word(&font->first) || cp > pgm_read_word(&font->last)) return m;
+  const GFXglyph* glyph = &((const GFXglyph*)pgm_read_ptr(&font->glyph))[cp - pgm_read_word(&font->first)];
+  m.width    = pgm_read_byte(&glyph->width);
+  m.height   = pgm_read_byte(&glyph->height);
+  m.xAdvance = pgm_read_byte(&glyph->xAdvance);
+  m.xOffset  = (int8_t)pgm_read_byte(&glyph->xOffset);
+  m.yOffset  = (int8_t)pgm_read_byte(&glyph->yOffset);
+  return m;
+}
+
+int drawHebrewWord(const GFXfont* font, const String& word, int x, int y) {
+  int cursor = x;
+  int lastBaseX = x;
+  int lastBaseXOff = 0;
+  int lastBaseW = 0;
+
+  int i = 0;
+  while (i < (int)word.length()) {
+    uint16_t cp = decodeUTF8(word, i);
+    GlyphMetrics m = getGlyphMetrics(font, cp);
+
+    if (isNiqudCP(cp)) {
+      int markX;
+      if (cp == 0x05C1)        // SHIN DOT — right side of letter
+        markX = lastBaseX + lastBaseXOff + lastBaseW - m.width;
+      else if (cp == 0x05C2 || cp == 0x05B9)  // SIN DOT / HOLAM — left side
+        markX = lastBaseX + lastBaseXOff;
+      else                     // all other niqud — centered
+        markX = lastBaseX + lastBaseXOff + lastBaseW / 2 - m.width / 2;
+      int markY = y + m.yOffset;
+      drawGlyphBitmap(font, cp, markX, markY);
+    } else {
+      drawGlyphBitmap(font, cp, cursor + m.xOffset, y + m.yOffset);
+      lastBaseX = cursor;
+      lastBaseXOff = m.xOffset;
+      lastBaseW = m.width;
+      cursor += m.xAdvance;
+    }
+  }
+  return cursor - x;
+}
+
+int measureHebrewWord(const GFXfont* font, const String& word) {
+  int width = 0;
+  int i = 0;
+  while (i < (int)word.length()) {
+    uint16_t cp = decodeUTF8(word, i);
+    if (!isNiqudCP(cp))
+      width += getGlyphMetrics(font, cp).xAdvance;
+  }
+  return width;
+}
+
 String reverseHebrew(const String& word) {
-  String chars[32];
+  String clusters[32];
   int count = 0;
   int i = 0;
   while (i < (int)word.length() && count < 32) {
     uint8_t c = (uint8_t)word[i];
     if ((c & 0xE0) == 0xC0 && i + 1 < (int)word.length()) {
-      chars[count++] = word.substring(i, i + 2);
+      clusters[count] = word.substring(i, i + 2);
       i += 2;
+      while (i + 1 < (int)word.length() &&
+             isNikudByte((uint8_t)word[i], (uint8_t)word[i + 1])) {
+        clusters[count] += word.substring(i, i + 2);
+        i += 2;
+      }
+      count++;
     } else {
-      chars[count++] = word.substring(i, i + 1);
+      clusters[count++] = word.substring(i, i + 1);
       i++;
     }
   }
   String result;
   for (int j = count - 1; j >= 0; j--)
-    result += chars[j];
+    result += clusters[j];
   return result;
 }
 
@@ -371,7 +480,8 @@ String reverseHebrew(const String& word) {
 int drawHebrewLine(const String& text, int cx, int y, int scale) {
   if (text.length() == 0) return 0;
 
-  // Split into words
+  const GFXfont* font = &NotoSerifHebrew_Bold_85;
+
   String words[10];
   int wordCount = 0;
   int start = 0;
@@ -383,58 +493,48 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
     }
   }
 
-  // Reverse each word for LTR drawing
   String reversed[10];
   for (int i = 0; i < wordCount; i++)
     reversed[i] = reverseHebrew(words[i]);
 
-  epaper.setFreeFont(&NotoSerifHebrew_Bold_85);
-  epaper.setTextColor(TFT_BLACK);
-  epaper.setTextSize(scale);
-
-  // Measure total width
   int totalW = 0;
   for (int i = 0; i < wordCount; i++) {
-    totalW += epaper.textWidth(reversed[i].c_str());
+    totalW += measureHebrewWord(font, reversed[i]);
     if (i < wordCount - 1) totalW += HEBREW_SPACE_W;
   }
 
-  // Draw words RTL: last source word drawn first (leftmost)
   int curX = cx - totalW / 2;
   int fontH = FONT_BASE_H * scale;
 
   for (int i = wordCount - 1; i >= 0; i--) {
-    epaper.drawString(reversed[i].c_str(), curX, y);
-    curX += epaper.textWidth(reversed[i].c_str());
+    int wordW = drawHebrewWord(font, reversed[i], curX, y);
+    curX += wordW;
     if (i > 0) curX += HEBREW_SPACE_W;
   }
 
-  epaper.setTextSize(1);
-  epaper.setTextFont(0);
   return fontH;
 }
 
 // ──────────────────────────────────────────────────────
 //  Build the two-line phrase for the current time
 // ──────────────────────────────────────────────────────
-void splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3) {
+void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
   int hour12 = t.tm_hour % 12;
   if (hour12 == 0) hour12 = 12;
   int min = t.tm_min;
+  String period = String(getTimePeriod(t.tm_hour));
 
   if (isSubtractMinute(min)) {
     int next = (hour12 % 12) + 1;       // 12 -> 1
-    line1 = String(SUBTRACT_AMOUNT[min]);
-    line2 = String(HOURS_LAMED[next - 1]);
+    line1 = String(SUBTRACT_AMOUNT[min]) + " " + String(HOURS_LAMED[next - 1]);
+    line2 = period;
   } else if (min == 0) {
     line1 = String(HOURS[hour12 - 1]);
-    line2 = "";
+    line2 = period;
   } else {
-    line1 = String(HOURS[hour12 - 1]);
-    line2 = String(MINUTE_PREFIX[min]);
+    line1 = String(HOURS[hour12 - 1]) + " " + String(MINUTE_PREFIX[min]);
+    line2 = period;
   }
-
-  line3 = String(getTimePeriod(t.tm_hour));
 }
 
 // ──────────────────────────────────────────────────────
@@ -444,8 +544,8 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2, String& l
 //  redraw only the time box and use partial refresh.
 // ──────────────────────────────────────────────────────
 void drawTimeInWords(const struct tm& t, bool fullRefresh) {
-  String line1, line2, line3;
-  splitTimePhrase(t, line1, line2, line3);
+  String line1, line2;
+  splitTimePhrase(t, line1, line2);
   Serial.printf(
     "Drawing time hour=%d min=%d fullRefresh=%d\n",
     t.tm_hour,
@@ -458,24 +558,18 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
 
   int cx     = SCREEN_W / 2;
   int fontH  = FONT_BASE_H * TEXT_SCALE;
-  int lineCount = 1 + (line2.length() > 0 ? 1 : 0) + 1; // line1 + optional line2 + line3
-  int totalH = lineCount * fontH + (lineCount - 1) * LINE_GAP;
+  int totalH = 2 * fontH + LINE_GAP;
   int y      = TIME_BOX_Y + (TIME_BOX_H - totalH) / 2;
 
   drawHebrewLine(line1, cx, y, TEXT_SCALE);
-  int nextY = y + fontH + LINE_GAP;
-  if (line2.length() > 0) {
-    drawHebrewLine(line2, cx, nextY, TEXT_SCALE);
-    nextY += fontH + LINE_GAP;
-  }
-  drawHebrewLine(line3, cx, nextY, TEXT_SCALE);
+  drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
 
   if (fullRefresh) {
     epaper.update();
   } else {
     epaper.updataPartial(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
   }
-  Serial.printf("Drew \"%s\" / \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str(), line3.c_str());
+  Serial.printf("Drew \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str());
 }
 
 // ──────────────────────────────────────────────────────
