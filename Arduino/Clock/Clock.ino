@@ -56,7 +56,7 @@ const bool  ENABLE_TIME_DEBUG  = true;
 
 // Rectangle that gets cleared & redrawn (must satisfy 8-px X alignment for partial refresh)
 #define TIME_BOX_X       0
-#define TIME_BOX_Y       40
+#define TIME_BOX_Y       60
 #define TIME_BOX_W       800
 #define TIME_BOX_H       400
 
