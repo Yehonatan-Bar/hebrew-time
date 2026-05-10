@@ -1,5 +1,5 @@
 // time_words.h
-// Hebrew time-as-words tables (no niqud — clean display).
+// Hebrew time-as-words tables (no niqud).
 //
 // Display rule used by drawTimeInWords():
 //   minute  0           -> just HOURS[h]
@@ -46,16 +46,16 @@ const char* const HOURS_LAMED[12] = {
 // ── Minute fragment that comes AFTER the hour name ──────────────────
 const char* const MINUTE_PREFIX[60] = {
   /* :00 */ "",
-  /* :01 */ "ואחד",
-  /* :02 */ "ושניים",
-  /* :03 */ "ושלושה",
-  /* :04 */ "וארבעה",
-  /* :05 */ "וחמישה",
-  /* :06 */ "ושישה",
-  /* :07 */ "ושבעה",
-  /* :08 */ "ושמונה",
-  /* :09 */ "ותשעה",
-  /* :10 */ "ועשרה",
+  /* :01 */ "ודקה אחת",
+  /* :02 */ "ושתי דקות",
+  /* :03 */ "ושלוש דקות",
+  /* :04 */ "וארבע דקות",
+  /* :05 */ "וחמש דקות",
+  /* :06 */ "ושש דקות",
+  /* :07 */ "ושבע דקות",
+  /* :08 */ "ושמונה דקות",
+  /* :09 */ "ותשע דקות",
+  /* :10 */ "ועשר דקות",
   /* :11 */ "ואחת עשרה דקות",
   /* :12 */ "ושתים עשרה דקות",
   /* :13 */ "ושלוש עשרה דקות",
@@ -65,7 +65,7 @@ const char* const MINUTE_PREFIX[60] = {
   /* :17 */ "ושבע עשרה דקות",
   /* :18 */ "ושמונה עשרה דקות",
   /* :19 */ "ותשע עשרה דקות",
-  /* :20 */ "ועשרים",
+  /* :20 */ "ועשרים דקות",
   /* :21 */ "ועשרים ואחת",
   /* :22 */ "ועשרים ושתיים",
   /* :23 */ "ועשרים ושלוש",
@@ -123,4 +123,13 @@ const char* const SUBTRACT_AMOUNT[60] = {
 
 inline bool isSubtractMinute(int m) {
   return m == 40 || m == 45 || m == 50 || m == 55;
+}
+
+// ── Time-of-day period ─────────────────────────────────────────────────
+inline const char* getTimePeriod(int hour24) {
+  if (hour24 >= 6 && hour24 < 12)  return "בבוקר";
+  if (hour24 >= 12 && hour24 < 18) return "בצהריים";
+  if (hour24 >= 18 && hour24 < 24) return "בערב";
+  if (hour24 >= 0 && hour24 < 4)   return "בלילה";
+  /* 4..5 */                        return "לפנות בוקר";
 }

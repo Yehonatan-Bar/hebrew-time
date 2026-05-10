@@ -1,6 +1,6 @@
 // Smart Board — Hebrew word clock
 //
-// Displays the current time in Hebrew words with niqud (vowel marks)
+// Displays the current time in Hebrew words
 // on a 7.5" e-ink display (Seeed XIAO e-paper driver, model 502).
 //
 // Update cadence:
@@ -81,18 +81,13 @@ struct TimeDebugSnapshot {
 RTC_DATA_ATTR TimeDebugSnapshot lastSleepSnapshot;
 RTC_DATA_ATTR bool              lastSleepSnapshotValid = false;
 
-// ── Types ─────────────────────────────────────────────
-struct HebrewToken {
-  String letter;        // one base letter, OR " " for a space
-  String marks[4];      // up to 4 niqud per base letter
-  int    markCount;
-  bool   isSpace;
-};
+// ── Forward: Hebrew RTL helper ────────────────────────
 
 // ── Forward declarations ──────────────────────────────
 void   applyTimeZone();
 void   ntpSync();
 void   drawTimeInWords(const struct tm& t, bool fullRefresh);
+void   splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3);
 void   drawError(const String& msg);
 void   goToSleep(int seconds);
 bool   isLowFrequencyTime(const struct tm& t);
@@ -344,171 +339,74 @@ void ntpSync() {
 }
 
 // ──────────────────────────────────────────────────────
-//  Hebrew tokenizer — groups each base letter with the
-//  niqud (combining marks) that follow it in source order.
+//  Hebrew RTL support.
+//  GFXfont draws characters LTR. To display Hebrew we
+//  reverse each word so drawString() renders it correctly.
 // ──────────────────────────────────────────────────────
-bool isHebrewNikudUtf8(uint8_t b0, uint8_t b1) {
-  // U+05B0..U+05BD  → 0xD6 0xB0..0xBD  (sheva, hatafs, vowels, dagesh, meteg)
-  // U+05BF          → 0xD6 0xBF        (rafe)
-  // U+05C1, U+05C2  → 0xD7 0x81, 0x82  (shin/sin dot)
-  // U+05C7          → 0xD7 0x87        (qamatz qatan)
-  if (b0 == 0xD6 && b1 >= 0xB0 && b1 <= 0xBD) return true;
-  if (b0 == 0xD6 && b1 == 0xBF) return true;
-  if (b0 == 0xD7 && (b1 == 0x81 || b1 == 0x82 || b1 == 0x87)) return true;
-  return false;
-}
-
-int tokenizeHebrew(const String& s, HebrewToken* out, int maxTokens) {
-  int count = 0, i = 0;
-  while (i < (int)s.length() && count < maxTokens) {
-    char c = s[i];
-    if (c == ' ') {
-      out[count].letter    = " ";
-      out[count].markCount = 0;
-      out[count].isSpace   = true;
-      count++; i++;
-    } else if (((uint8_t)c & 0xE0) == 0xC0) {
-      if (i + 1 >= (int)s.length()) { i++; continue; }
-      out[count].letter    = s.substring(i, i + 2);
-      out[count].markCount = 0;
-      out[count].isSpace   = false;
+String reverseHebrew(const String& word) {
+  String chars[32];
+  int count = 0;
+  int i = 0;
+  while (i < (int)word.length() && count < 32) {
+    uint8_t c = (uint8_t)word[i];
+    if ((c & 0xE0) == 0xC0 && i + 1 < (int)word.length()) {
+      chars[count++] = word.substring(i, i + 2);
       i += 2;
-      while (i + 1 < (int)s.length() &&
-             isHebrewNikudUtf8((uint8_t)s[i], (uint8_t)s[i+1]) &&
-             out[count].markCount < 4) {
-        out[count].marks[out[count].markCount++] = s.substring(i, i + 2);
-        i += 2;
-      }
-      count++;
     } else {
-      out[count].letter    = s.substring(i, i + 1);
-      out[count].markCount = 0;
-      out[count].isSpace   = false;
-      count++; i++;
+      chars[count++] = word.substring(i, i + 1);
+      i++;
     }
   }
-  return count;
+  String result;
+  for (int j = count - 1; j >= 0; j--)
+    result += chars[j];
+  return result;
 }
 
 // ──────────────────────────────────────────────────────
-//  Draw a niqud mark as primitive shapes.
-//  cx     = horizontal centre of the base letter
-//  yTop   = top y of the letter
-//  fontH  = visual letter height at current scale
-//  scale  = textSize multiplier (so niqud scale together)
-//
-//  NOTE: visual offsets here are first-pass guesses.
-//  Tweak by eye after seeing real output.
-// ──────────────────────────────────────────────────────
-void drawNikudMark(const String& mark, int cx, int yTop, int fontH, int scale) {
-  if (mark.length() < 2) return;
-  uint8_t b0 = (uint8_t)mark[0], b1 = (uint8_t)mark[1];
-  uint16_t cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
-
-  int baseline = yTop + fontH;
-  int dotR     = max(2, fontH / 20);
-  int gap      = fontH / 8;
-
-  int sp = dotR * 3;  // spacing between dots
-  int lineW = fontH / 4;
-  int lineH = max(2, fontH / 30);
-
-  switch (cp) {
-    case 0x05B0:  // sheva — two vertical dots below
-      epaper.fillCircle(cx, baseline + gap,        dotR, TFT_BLACK);
-      epaper.fillCircle(cx, baseline + gap + sp,   dotR, TFT_BLACK);
-      break;
-    case 0x05B1:  // hataf segol = sheva + segol
-      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
-      epaper.fillCircle(cx + sp, baseline + gap + sp,   dotR, TFT_BLACK);
-      epaper.fillCircle(cx - sp/2, baseline + gap,      dotR, TFT_BLACK);
-      epaper.fillCircle(cx - sp*2, baseline + gap,      dotR, TFT_BLACK);
-      epaper.fillCircle(cx - sp,   baseline + gap + sp, dotR, TFT_BLACK);
-      break;
-    case 0x05B2:  // hataf patah = sheva + patah line
-      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
-      epaper.fillCircle(cx + sp, baseline + gap + sp,   dotR, TFT_BLACK);
-      epaper.fillRect(cx - lineW - sp, baseline + gap + sp/2, lineW, lineH, TFT_BLACK);
-      break;
-    case 0x05B3:  // hataf qamatz = sheva + qamatz
-      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
-      epaper.fillCircle(cx + sp, baseline + gap + sp,   dotR, TFT_BLACK);
-      epaper.fillRect(cx - lineW - sp, baseline + gap + sp/2,     lineW, lineH,  TFT_BLACK);
-      epaper.fillRect(cx - sp - lineW/2, baseline + gap + sp/2,   lineH, sp,     TFT_BLACK);
-      break;
-    case 0x05B4:  // hiriq — single dot below
-      epaper.fillCircle(cx, baseline + gap + sp/2, dotR, TFT_BLACK);
-      break;
-    case 0x05B5:  // tsere — two horizontal dots below
-      epaper.fillCircle(cx - sp, baseline + gap + sp/2, dotR, TFT_BLACK);
-      epaper.fillCircle(cx + sp, baseline + gap + sp/2, dotR, TFT_BLACK);
-      break;
-    case 0x05B6:  // segol — three dots in inverted triangle below
-      epaper.fillCircle(cx - sp, baseline + gap,        dotR, TFT_BLACK);
-      epaper.fillCircle(cx + sp, baseline + gap,        dotR, TFT_BLACK);
-      epaper.fillCircle(cx,      baseline + gap + sp,   dotR, TFT_BLACK);
-      break;
-    case 0x05B7:  // patah — horizontal line below
-      epaper.fillRect(cx - lineW/2, baseline + gap + sp/2, lineW, lineH, TFT_BLACK);
-      break;
-    case 0x05B8:  // qamatz — T-shape below (line + small vertical)
-    case 0x05C7:  // qamatz qatan
-      epaper.fillRect(cx - lineW/2, baseline + gap + sp/2,        lineW, lineH, TFT_BLACK);
-      epaper.fillRect(cx - lineH/2, baseline + gap + sp/2 + lineH, lineH, sp,  TFT_BLACK);
-      break;
-    case 0x05B9:  // holam — dot above
-    case 0x05BA:  // holam haser
-      epaper.fillCircle(cx, yTop - gap, dotR, TFT_BLACK);
-      break;
-    case 0x05BB:  // qubuts — three diagonal dots below
-      epaper.fillCircle(cx - sp, baseline + gap,          dotR, TFT_BLACK);
-      epaper.fillCircle(cx,      baseline + gap + sp/2,   dotR, TFT_BLACK);
-      epaper.fillCircle(cx + sp, baseline + gap + sp,     dotR, TFT_BLACK);
-      break;
-    case 0x05BC:  // dagesh / mappiq — dot inside letter
-      epaper.fillCircle(cx, yTop + fontH/2, dotR, TFT_BLACK);
-      break;
-    case 0x05C1:  // shin dot — above-right
-      epaper.fillCircle(cx + sp*2, yTop - gap, dotR, TFT_BLACK);
-      break;
-    case 0x05C2:  // sin dot — above-left
-      epaper.fillCircle(cx - sp*2, yTop - gap, dotR, TFT_BLACK);
-      break;
-    default: break;
-  }
-}
-
-// ──────────────────────────────────────────────────────
-//  Draw a single line of Hebrew text (with niqud) centred at cx, top at y.
+//  Draw a single line of Hebrew text centred at cx, top at y.
+//  Each word is reversed for LTR rendering, and words are
+//  placed right-to-left across the line.
 // ──────────────────────────────────────────────────────
 int drawHebrewLine(const String& text, int cx, int y, int scale) {
   if (text.length() == 0) return 0;
-  HebrewToken tokens[64];
-  int n = tokenizeHebrew(text, tokens, 64);
+
+  // Split into words
+  String words[10];
+  int wordCount = 0;
+  int start = 0;
+  for (int i = 0; i <= (int)text.length(); i++) {
+    if (i == (int)text.length() || text[i] == ' ') {
+      if (i > start && wordCount < 10)
+        words[wordCount++] = text.substring(start, i);
+      start = i + 1;
+    }
+  }
+
+  // Reverse each word for LTR drawing
+  String reversed[10];
+  for (int i = 0; i < wordCount; i++)
+    reversed[i] = reverseHebrew(words[i]);
 
   epaper.setFreeFont(&Heebo_Bold_85);
   epaper.setTextColor(TFT_BLACK);
   epaper.setTextSize(scale);
 
-  int letterGap = 5;
+  // Measure total width
   int totalW = 0;
-  int letterCount = 0;
-  for (int i = 0; i < n; i++) {
-    if (tokens[i].isSpace) totalW += HEBREW_SPACE_W;
-    else { totalW += epaper.textWidth(tokens[i].letter.c_str()); letterCount++; }
+  for (int i = 0; i < wordCount; i++) {
+    totalW += epaper.textWidth(reversed[i].c_str());
+    if (i < wordCount - 1) totalW += HEBREW_SPACE_W;
   }
-  totalW += (letterCount - 1) * letterGap;
 
-  int curX  = cx - totalW / 2;
+  // Draw words RTL: last source word drawn first (leftmost)
+  int curX = cx - totalW / 2;
   int fontH = FONT_BASE_H * scale;
 
-  // Hebrew RTL: source[0] is rightmost on screen,
-  // iterate in reverse while drawing left-to-right.
-  for (int i = n - 1; i >= 0; i--) {
-    HebrewToken& t = tokens[i];
-    if (t.isSpace) { curX += HEBREW_SPACE_W; continue; }
-    epaper.drawString(t.letter.c_str(), curX, y);
-    curX += epaper.textWidth(t.letter.c_str()) + letterGap;
+  for (int i = wordCount - 1; i >= 0; i--) {
+    epaper.drawString(reversed[i].c_str(), curX, y);
+    curX += epaper.textWidth(reversed[i].c_str());
+    if (i > 0) curX += HEBREW_SPACE_W;
   }
 
   epaper.setTextSize(1);
@@ -519,7 +417,7 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
 // ──────────────────────────────────────────────────────
 //  Build the two-line phrase for the current time
 // ──────────────────────────────────────────────────────
-void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
+void splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3) {
   int hour12 = t.tm_hour % 12;
   if (hour12 == 0) hour12 = 12;
   int min = t.tm_min;
@@ -535,6 +433,8 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
     line1 = String(HOURS[hour12 - 1]);
     line2 = String(MINUTE_PREFIX[min]);
   }
+
+  line3 = String(getTimePeriod(t.tm_hour));
 }
 
 // ──────────────────────────────────────────────────────
@@ -544,8 +444,8 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2) {
 //  redraw only the time box and use partial refresh.
 // ──────────────────────────────────────────────────────
 void drawTimeInWords(const struct tm& t, bool fullRefresh) {
-  String line1, line2;
-  splitTimePhrase(t, line1, line2);
+  String line1, line2, line3;
+  splitTimePhrase(t, line1, line2, line3);
   Serial.printf(
     "Drawing time hour=%d min=%d fullRefresh=%d\n",
     t.tm_hour,
@@ -558,19 +458,24 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
 
   int cx     = SCREEN_W / 2;
   int fontH  = FONT_BASE_H * TEXT_SCALE;
-  bool two   = line2.length() > 0;
-  int totalH = (two ? 2 : 1) * fontH + (two ? LINE_GAP : 0);
+  int lineCount = 1 + (line2.length() > 0 ? 1 : 0) + 1; // line1 + optional line2 + line3
+  int totalH = lineCount * fontH + (lineCount - 1) * LINE_GAP;
   int y      = TIME_BOX_Y + (TIME_BOX_H - totalH) / 2;
 
   drawHebrewLine(line1, cx, y, TEXT_SCALE);
-  if (two) drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
+  int nextY = y + fontH + LINE_GAP;
+  if (line2.length() > 0) {
+    drawHebrewLine(line2, cx, nextY, TEXT_SCALE);
+    nextY += fontH + LINE_GAP;
+  }
+  drawHebrewLine(line3, cx, nextY, TEXT_SCALE);
 
   if (fullRefresh) {
     epaper.update();
   } else {
     epaper.updataPartial(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
   }
-  Serial.printf("Drew \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str());
+  Serial.printf("Drew \"%s\" / \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str(), line3.c_str());
 }
 
 // ──────────────────────────────────────────────────────

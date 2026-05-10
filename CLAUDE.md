@@ -1,14 +1,7 @@
----
+for compiling im sending 
+ & "C:\Users\User\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --fqbn espressif:esp32:XIAO_ESP32C3 "c:\projects\smart_board\Arduino\Clock\Clock.ino"
 
-# MANDATORY: Post-Task Documentation (SR-PTD)
+in PS
 
-**CRITICAL: After completing ANY task that modifies files, you MUST invoke this skill:**
-
-```
-Skill tool -> skill: "sr-ptd-skill"
-```
-
-**This is NOT optional. Skipping this skill means the task is INCOMPLETE.**
-
-When planning ANY development task, add as the FINAL item in your task list:
-```
+for uploading im sending
+ & "C:\Users\User\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" upload --fqbn espressif:esp32:XIAO_ESP32C3 --port COM3 "c:\projects\smart_board\Arduino\Clock\Clock.ino"
