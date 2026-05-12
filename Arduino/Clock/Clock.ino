@@ -3,7 +3,7 @@
 // Displays the current time in Hebrew words
 // on a 7.5" e-ink display (Seeed XIAO e-paper driver, model 502).
 //
-// Update cadence: every 2 minutes
+// Update cadence: every 1 minute
 //
 // SETUP NOTE — partial refresh:
 //   To enable partial-refresh updates, add this line to your library setup
@@ -30,7 +30,7 @@
 
 EPaper epaper = EPaper();
 
-// ── Wi-Fi (used briefly for NTP sync, ~once per day) ──
+// ── Wi-Fi (used briefly for scheduled NTP syncs) ──
 const char* ssid     = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
 
@@ -40,10 +40,10 @@ const char* timeZone           = "IST-2IDT,M3.4.4/26,M10.5.0"; // Israel: UTC+2 
 const bool  ENABLE_TIME_DEBUG  = true;
 
 // ── Sleep / refresh schedule ──────────────────────────
-#define SLEEP_FAST_SEC   120
+#define SLEEP_FAST_SEC   60
 #define SLEEP_SLOW_SEC   300
 #define WIFI_TIMEOUT     20
-#define TIME_OFFSET_SEC  60
+#define TIME_OFFSET_SEC  60   // keep the displayed time one minute ahead
 
 // ── Layout ────────────────────────────────────────────
 #define SCREEN_W         800
@@ -61,12 +61,17 @@ const bool  ENABLE_TIME_DEBUG  = true;
 #define TIME_BOX_W       800
 #define TIME_BOX_H       400
 
+#define MAX_LINES 3
+
 // ── State preserved across deep-sleep cycles ──────────
 RTC_DATA_ATTR int    ntpDay    = -1;
+RTC_DATA_ATTR int    ntpSlot   = -1;
 RTC_DATA_ATTR int    bootCount = 0;
 RTC_DATA_ATTR bool   firstBoot = true;
 RTC_DATA_ATTR time_t savedEpoch = 0;
 RTC_DATA_ATTR int    savedSleepSec = 0;
+RTC_DATA_ATTR char   prevLines[MAX_LINES][64];
+RTC_DATA_ATTR int    prevLineCount = 0;
 
 struct TimeDebugSnapshot {
   time_t epoch;
@@ -77,6 +82,7 @@ struct TimeDebugSnapshot {
   int    utcHour;
   int    utcMin;
   int    ntpDay;
+  int    ntpSlot;
   int    bootCount;
   bool   firstBoot;
 };
@@ -95,13 +101,15 @@ struct GlyphMetrics {
 
 // ── Forward declarations ──────────────────────────────
 void   applyTimeZone();
-void   ntpSync();
+bool   ntpSync(struct tm* syncedTime);
 void   drawTimeInWords(const struct tm& t, bool fullRefresh);
 void   splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3);
 void   drawError(const String& msg);
 void   goToSleep(int seconds);
 bool   isLowFrequencyTime(const struct tm& t);
 int    sleepSeconds(const struct tm& t);
+int    scheduledNtpSlot(const struct tm& t);
+bool   shouldRunScheduledNtp(const struct tm& t);
 const char* wakeCauseName(esp_sleep_wakeup_cause_t cause);
 void   logTm(const char* label, const struct tm& t);
 void   logClockState(const char* label);
@@ -118,12 +126,13 @@ void setup() {
 
   bootCount++;
   Serial.printf(
-    "Boot #%d wakeCause=%s(%d) firstBoot=%d ntpDay=%d\n",
+    "Boot #%d wakeCause=%s(%d) firstBoot=%d ntpDay=%d ntpSlot=%d\n",
     bootCount,
     wakeCauseName(esp_sleep_get_wakeup_cause()),
     (int)esp_sleep_get_wakeup_cause(),
     firstBoot,
-    ntpDay
+    ntpDay,
+    ntpSlot
   );
   printSleepSnapshot();
   logClockState("boot/before applyTimeZone");
@@ -147,34 +156,49 @@ void setup() {
   struct tm t;
   bool haveTime = getLocalTime(&t);
   logGetLocalTimeResult("boot/initial", haveTime, haveTime ? &t : nullptr);
-  bool needNTP  = firstBoot || !haveTime || (haveTime && t.tm_yday != ntpDay);
+  bool scheduledSyncDue = haveTime && shouldRunScheduledNtp(t);
+  bool needNTP          = firstBoot || !haveTime || scheduledSyncDue;
   Serial.printf(
-    "needNTP=%d (firstBoot=%d haveTime=%d tm_yday=%d ntpDay=%d)\n",
+    "needNTP=%d (firstBoot=%d haveTime=%d scheduledSyncDue=%d tm_yday=%d ntpDay=%d ntpSlot=%d targetSlot=%d)\n",
     needNTP,
     firstBoot,
     haveTime,
+    scheduledSyncDue,
     haveTime ? t.tm_yday : -1,
-    ntpDay
+    ntpDay,
+    ntpSlot,
+    haveTime ? scheduledNtpSlot(t) : -1
   );
 
   if (needNTP) {
+    bool ntpSuccess = false;
     for (int attempt = 0; attempt < 3; attempt++) {
       Serial.printf("NTP attempt %d/3\n", attempt + 1);
-      ntpSync();
-      bool synced = getLocalTime(&t);
-      logGetLocalTimeResult("boot/post-ntp", synced, synced ? &t : nullptr);
+      ntpSuccess = ntpSync(&t);
+      logGetLocalTimeResult("boot/post-ntp", ntpSuccess, ntpSuccess ? &t : nullptr);
       logClockState("boot/post-ntp");
-      if (synced) break;
+      if (ntpSuccess) break;
       delay(2000);
     }
-    if (!getLocalTime(&t)) {
+    if (!ntpSuccess && !haveTime) {
       logClockState("boot/ntp-failed");
       drawError(String("NTP failed - retrying in ") + SLEEP_FAST_SEC + "s");
       goToSleep(SLEEP_FAST_SEC);
       return;
     }
-    ntpDay = t.tm_yday;
-    Serial.printf("Updated ntpDay=%d\n", ntpDay);
+    if (ntpSuccess) {
+      ntpDay  = t.tm_yday;
+      ntpSlot = scheduledNtpSlot(t);
+      Serial.printf("Updated ntpDay=%d ntpSlot=%d\n", ntpDay, ntpSlot);
+    } else {
+      Serial.println("Scheduled NTP sync failed - keeping restored time");
+      if (!getLocalTime(&t)) {
+        logClockState("boot/ntp-failed");
+        drawError(String("Time unavailable - retrying in ") + SLEEP_FAST_SEC + "s");
+        goToSleep(SLEEP_FAST_SEC);
+        return;
+      }
+    }
   }
 
   // Apply manual time offset
@@ -289,6 +313,7 @@ void storeSleepSnapshot() {
   lastSleepSnapshot.utcHour   = utcTm.tm_hour;
   lastSleepSnapshot.utcMin    = utcTm.tm_min;
   lastSleepSnapshot.ntpDay    = ntpDay;
+  lastSleepSnapshot.ntpSlot   = ntpSlot;
   lastSleepSnapshot.bootCount = bootCount;
   lastSleepSnapshot.firstBoot = firstBoot;
   lastSleepSnapshotValid      = true;
@@ -298,7 +323,7 @@ void printSleepSnapshot() {
   if (!ENABLE_TIME_DEBUG || !lastSleepSnapshotValid) return;
 
   Serial.printf(
-    "Prev sleep snapshot: boot=%d epoch=%lld local=yday %d %02d:%02d utc=yday %d %02d:%02d ntpDay=%d firstBoot=%d\n",
+    "Prev sleep snapshot: boot=%d epoch=%lld local=yday %d %02d:%02d utc=yday %d %02d:%02d ntpDay=%d ntpSlot=%d firstBoot=%d\n",
     lastSleepSnapshot.bootCount,
     (long long)lastSleepSnapshot.epoch,
     lastSleepSnapshot.localYday,
@@ -308,6 +333,7 @@ void printSleepSnapshot() {
     lastSleepSnapshot.utcHour,
     lastSleepSnapshot.utcMin,
     lastSleepSnapshot.ntpDay,
+    lastSleepSnapshot.ntpSlot,
     lastSleepSnapshot.firstBoot
   );
 }
@@ -320,6 +346,19 @@ bool isLowFrequencyTime(const struct tm& t) {
   if (t.tm_wday >= 0 && t.tm_wday <= 4 && t.tm_hour >= 9 && t.tm_hour < 13) return true;  // Sun-Thu 09:00-13:00
   if (t.tm_hour < 6) return true;                                                          // every day 00:00-06:00
   return false;
+}
+
+int scheduledNtpSlot(const struct tm& t) {
+  if (t.tm_hour >= 14) return 1;
+  if (t.tm_hour >= 6) return 0;
+  return -1;
+}
+
+bool shouldRunScheduledNtp(const struct tm& t) {
+  int targetSlot = scheduledNtpSlot(t);
+  if (targetSlot < 0) return false;
+  if (ntpDay != t.tm_yday) return true;
+  return ntpSlot < targetSlot;
 }
 
 bool isSpecialMinute(int m) {
@@ -336,7 +375,7 @@ int sleepSeconds(const struct tm& t) {
 // ──────────────────────────────────────────────────────
 //  NTP sync — turn WiFi on briefly, sync, turn off
 // ──────────────────────────────────────────────────────
-void ntpSync() {
+bool ntpSync(struct tm* syncedTime) {
   Serial.println("NTP sync...");
   logClockState("ntpSync/before WiFi");
   WiFi.begin(ssid, password);
@@ -358,6 +397,10 @@ void ntpSync() {
     }
     logGetLocalTimeResult("ntpSync/final", gotTime, gotTime ? &t : nullptr);
     logClockState("ntpSync/final");
+    if (gotTime && syncedTime) *syncedTime = t;
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return gotTime;
   } else {
     Serial.println("WiFi failed — keeping previous time");
   }
@@ -366,6 +409,7 @@ void ntpSync() {
   }
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  return false;
 }
 
 // ──────────────────────────────────────────────────────
@@ -594,26 +638,75 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
     fullRefresh
   );
 
-  if (fullRefresh) epaper.fillScreen(TFT_WHITE);
-  else             epaper.fillRect(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, TFT_WHITE);
+  int numLines = (line3.length() > 0) ? 3 : 2;
+  String lines[MAX_LINES] = { line1, line2, line3 };
+
+  // Check if anything actually changed since last draw
+  if (!fullRefresh) {
+    bool anyChanged = (numLines != prevLineCount);
+    if (!anyChanged) {
+      for (int i = 0; i < numLines; i++) {
+        if (strcmp(lines[i].c_str(), prevLines[i]) != 0) {
+          anyChanged = true;
+          break;
+        }
+      }
+    }
+    if (!anyChanged) {
+      Serial.println("No lines changed — skipping refresh");
+      return;
+    }
+  }
 
   int cx     = SCREEN_W / 2;
   int fontH  = FONT_BASE_H * TEXT_SCALE;
-  int numLines = (line3.length() > 0) ? 3 : 2;
-  int visH   = FONT_ASCENT + (numLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
-  int y      = TIME_BOX_Y + (TIME_BOX_H - visH) / 2 + FONT_ASCENT;
-
-  drawHebrewLine(line1, cx, y, TEXT_SCALE);
-  drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
-  if (numLines == 3) {
-    drawHebrewLine(line3, cx, y + 2 * (fontH + LINE_GAP), TEXT_SCALE);
-  }
 
   if (fullRefresh) {
+    epaper.fillScreen(TFT_WHITE);
+    int visH = FONT_ASCENT + (numLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
+    int y    = TIME_BOX_Y + (TIME_BOX_H - visH) / 2 + FONT_ASCENT;
+    drawHebrewLine(line1, cx, y, TEXT_SCALE);
+    drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
+    if (numLines == 3)
+      drawHebrewLine(line3, cx, y + 2 * (fontH + LINE_GAP), TEXT_SCALE);
     epaper.update();
   } else {
+    // 1) Reconstruct old image in sprite so controller knows what's on screen
+    epaper.fillRect(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, TFT_WHITE);
+    if (prevLineCount > 0) {
+      int oldNumLines = prevLineCount;
+      int oldVisH = FONT_ASCENT + (oldNumLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
+      int oldY    = TIME_BOX_Y + (TIME_BOX_H - oldVisH) / 2 + FONT_ASCENT;
+      for (int i = 0; i < oldNumLines; i++) {
+        if (prevLines[i][0] != '\0')
+          drawHebrewLine(String(prevLines[i]), cx, oldY + i * (fontH + LINE_GAP), TEXT_SCALE);
+      }
+    }
+    // 2) Snapshot this as "old" for the controller
+    epaper.snapshotRegion(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
+
+    // 3) Now draw the new content
+    epaper.fillRect(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, TFT_WHITE);
+    int visH = FONT_ASCENT + (numLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
+    int y    = TIME_BOX_Y + (TIME_BOX_H - visH) / 2 + FONT_ASCENT;
+    drawHebrewLine(line1, cx, y, TEXT_SCALE);
+    drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
+    if (numLines == 3)
+      drawHebrewLine(line3, cx, y + 2 * (fontH + LINE_GAP), TEXT_SCALE);
+
+    // 4) Partial update with both old and new buffers
     epaper.updataPartial(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
   }
+
+  // Save current state for next wake
+  for (int i = 0; i < MAX_LINES; i++) {
+    if (i < numLines)
+      strncpy(prevLines[i], lines[i].c_str(), sizeof(prevLines[i]) - 1);
+    else
+      prevLines[i][0] = '\0';
+  }
+  prevLineCount = numLines;
+
   Serial.printf("Drew \"%s\" / \"%s\" / \"%s\"\n", line1.c_str(), line2.c_str(), line3.c_str());
 }
 

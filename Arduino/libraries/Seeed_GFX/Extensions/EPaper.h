@@ -32,6 +32,8 @@ private:
     bool _entemp;
     float _temp;
     float _humi;
+    uint8_t* _old_img8;
+    bool     _old_valid;
 
     typedef struct 
     {

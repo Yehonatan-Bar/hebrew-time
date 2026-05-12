@@ -1,8 +1,10 @@
-EPaper::EPaper() : TFT_eSprite(this), _sleep(false), _entemp(true), _temp(16.00), _humi(50.00)
+EPaper::EPaper() : TFT_eSprite(this), _sleep(false), _entemp(true), _temp(16.00), _humi(50.00), _old_img8(nullptr), _old_valid(false)
 {
     setColorDepth(EPD_COLOR_DEPTH);
     createSprite(_width, _height, 1);
-    //createPalette(cmap, 16);
+    size_t bufSize = (size_t)(_width / 8) * _height;
+    _old_img8 = (uint8_t*)malloc(bufSize);
+    if (_old_img8) memset(_old_img8, 0xFF, bufSize);
 }
 
 void EPaper::begin(uint8_t wake)
@@ -40,6 +42,7 @@ void EPaper::begin(uint8_t wake)
 
 void EPaper::update()
 {
+    Serial.println("[EPaper] update() called (FULL refresh)");
     wake();
     EPD_SET_WINDOW(0, 0, (_width - 1), (_height - 1));
     if(!_grayLevel)
@@ -52,17 +55,21 @@ void EPaper::update()
             EPD_PUSH_NEW_COLORS(_width, _height, _img8);
         #endif
             EPD_UPDATE();
-    }    
+    }
     else
     {
-      #ifdef USE_MUTIGRAY_EPAPER  
+      #ifdef USE_MUTIGRAY_EPAPER
         #ifdef EPD_HORIZONTAL_MIRROR
             EPD_PUSH_NEW_GRAY_COLORS_FLIP(_width, _height, _img8);
         #else
             EPD_PUSH_NEW_GRAY_COLORS(_width, _height, _img8);
         #endif
             EPD_UPDATE_GRAY();
-      #endif  
+      #endif
+    }
+    if (_old_img8) {
+        memcpy(_old_img8, _img8, (size_t)(_width / 8) * _height);
+        _old_valid = true;
     }
     sleep();
 }
@@ -70,6 +77,7 @@ void EPaper::update()
 #ifdef USE_PARTIAL_EPAPER
 void EPaper::updataPartial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
+    Serial.printf("[EPaper] updataPartial called: x=%d y=%d w=%d h=%d _sleep=%d\n", x, y, w, h, _sleep);
 
     int32_t bx = x;
     int32_t by = y;
@@ -110,7 +118,14 @@ void EPaper::updataPartial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     wake();
     _sleep = false;
 #else
-    if (_sleep) { EPD_WAKEUP_PARTIAL(); _sleep = false; }
+    if (_sleep) {
+        Serial.println("[EPaper] was sleeping -> EPD_WAKEUP_PARTIAL");
+        EPD_WAKEUP_PARTIAL();
+        _sleep = false;
+    } else {
+        Serial.println("[EPaper] was awake -> EPD_INIT_PARTIAL (switching from FAST waveform)");
+        EPD_INIT_PARTIAL();
+    }
 #endif
 
     uint16_t x0 = ((uint16_t)bx) & ~(align_px - 1);
@@ -137,19 +152,44 @@ void EPaper::updataPartial(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 
 
 
+    uint8_t* oldbuf = nullptr;
+    if (_old_img8 && _old_valid) {
+        oldbuf = (uint8_t*)malloc(win_size);
+        if (oldbuf) {
+            const uint8_t* old_src = _old_img8 + (yy * stride) + (x0 >> 3);
+            for (uint16_t row = 0; row < hh; row++) {
+                memcpy(oldbuf + row * win_bytes_per_row,
+                       old_src + row * stride,
+                       win_bytes_per_row);
+            }
+        }
+    }
+
     #ifdef EPD_HORIZONTAL_MIRROR
     uint16_t x_end = x0 + w_aligned - 1;
     uint16_t mx0 = (_width - 1) - x_end;
     uint16_t mx1 = (_width - 1) - x0;
 
     EPD_SET_WINDOW(mx0, yy, mx1, yy + hh - 1);
+    if (oldbuf) { EPD_PUSH_OLD_COLORS_FLIP(w_aligned, hh, oldbuf); }
     EPD_PUSH_NEW_COLORS_FLIP(w_aligned, hh, winbuf);
     #else
     EPD_SET_WINDOW(x0, yy, x0 + w_aligned - 1, yy + hh - 1);
+    if (oldbuf) { EPD_PUSH_OLD_COLORS(w_aligned, hh, oldbuf); }
     EPD_PUSH_NEW_COLORS(w_aligned, hh, winbuf);
     #endif
     EPD_UPDATE_PARTIAL();
 
+    if (_old_img8) {
+        for (uint16_t row = 0; row < hh; row++) {
+            memcpy(_old_img8 + ((yy + row) * stride) + (x0 >> 3),
+                   winbuf + row * win_bytes_per_row,
+                   win_bytes_per_row);
+        }
+        _old_valid = true;
+    }
+
+    if (oldbuf) free(oldbuf);
     free(winbuf);
     sleep();
 }
