@@ -9,15 +9,18 @@ public:
     void drawBufferPixel(int32_t x, int32_t y, uint32_t color, uint8_t bpp);
     void update();
     void update(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t *data);
-    void updataPartial(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
-    
+    void updataPartial(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t* oldBuf = nullptr);
+    uint8_t* capturePartialWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+
 #ifdef  USE_MUTIGRAY_EPAPER
     void initGrayMode(uint8_t grayLevel);
     void deinitGrayMode();
 #endif
     void sleep();
     void wake();
-    
+    void powerOff();
+    bool isPowerOff() const { return _powerOff; }
+
     typedef float (*GetTempCallback)();
     typedef float (*GetHumiCallback)();
     void  setTemp(GetTempCallback callback);
@@ -25,17 +28,16 @@ public:
     void  setHumi(GetHumiCallback callback);
     float getHumi();
 
-    
+
 private:
     uint8_t _grayLevel;
     bool _sleep;
+    bool _powerOff;
     bool _entemp;
     float _temp;
     float _humi;
-    uint8_t* _old_img8;
-    bool     _old_valid;
 
-    typedef struct 
+    typedef struct
     {
        uint16_t x1;
        uint16_t x2;
@@ -44,4 +46,3 @@ private:
     } freshArea_t;
     freshArea_t _freshArea;
 };
-

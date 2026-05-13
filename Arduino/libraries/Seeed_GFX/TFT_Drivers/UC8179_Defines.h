@@ -75,6 +75,15 @@
         writedata(0xA5);    \
     } while (0)
 
+#define EPD_POWER_OFF_ONLY()  \
+    do                        \
+    {                         \
+        writecommand(0X50);   \
+        writedata(0xf7);      \
+        writecommand(0x02);   \
+        CHECK_BUSY();         \
+    } while (0)
+
 #define EPD_INIT_FULL()          \
     do                           \
     {                            \

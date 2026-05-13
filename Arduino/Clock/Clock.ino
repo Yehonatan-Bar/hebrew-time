@@ -22,6 +22,7 @@
 #include <sys/time.h>
 #include <stdlib.h>
 #include "esp_sleep.h"
+#include "esp_sntp.h"
 #include <Fonts/Custom/NotoSerifHebrew_Bold_85.h>
 #include "time_words.h"
 #include "secrets.h"
@@ -44,6 +45,7 @@ const bool  ENABLE_TIME_DEBUG  = true;
 #define SLEEP_SLOW_SEC   300
 #define WIFI_TIMEOUT     20
 #define TIME_OFFSET_SEC  60   // keep the displayed time one minute ahead
+#define FULL_REFRESH_EVERY 60 // full refresh every ~60 partial cycles to clear ghosting
 
 // ── Layout ────────────────────────────────────────────
 #define SCREEN_W         800
@@ -72,6 +74,7 @@ RTC_DATA_ATTR time_t savedEpoch = 0;
 RTC_DATA_ATTR int    savedSleepSec = 0;
 RTC_DATA_ATTR char   prevLines[MAX_LINES][64];
 RTC_DATA_ATTR int    prevLineCount = 0;
+RTC_DATA_ATTR int    partialCount = 0;
 
 struct TimeDebugSnapshot {
   time_t epoch;
@@ -103,6 +106,7 @@ struct GlyphMetrics {
 void   applyTimeZone();
 bool   ntpSync(struct tm* syncedTime);
 void   drawTimeInWords(const struct tm& t, bool fullRefresh);
+void   drawCenteredLines(const String& l1, const String& l2, const String& l3, int numLines);
 void   splitTimePhrase(const struct tm& t, String& line1, String& line2, String& line3);
 void   drawError(const String& msg);
 void   goToSleep(int seconds);
@@ -125,6 +129,27 @@ void setup() {
   delay(300);
 
   bootCount++;
+
+  // ── Diagnostic: check if ESP32 RTC maintains time across deep sleep ──
+  time_t rtcEpoch = 0;
+  time(&rtcEpoch);
+  int64_t bootMicros = esp_timer_get_time();
+  time_t manualEpoch = savedEpoch + savedSleepSec;
+  Serial.printf(
+    "=== CLOCK DRIFT DIAG ===\n"
+    "  RTC auto epoch   = %lld (what the HW clock says)\n"
+    "  Manual restore   = %lld (savedEpoch %lld + sleep %d)\n"
+    "  Difference       = %lld sec (positive = RTC is ahead)\n"
+    "  Boot elapsed     = %lld us\n"
+    "========================\n",
+    (long long)rtcEpoch,
+    (long long)manualEpoch,
+    (long long)savedEpoch,
+    savedSleepSec,
+    (long long)(rtcEpoch - manualEpoch),
+    (long long)bootMicros
+  );
+
   Serial.printf(
     "Boot #%d wakeCause=%s(%d) firstBoot=%d ntpDay=%d ntpSlot=%d\n",
     bootCount,
@@ -384,19 +409,25 @@ bool ntpSync(struct tm* syncedTime) {
   Serial.printf("WiFi status=%d after %d waits\n", WiFi.status(), tries);
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("Calling configTzTime(TZ=%s, server=%s)\n", timeZone, ntpServer);
+    sntp_restart();
     configTzTime(timeZone, ntpServer);
     logClockState("ntpSync/after configTzTime");
-    struct tm t;
-    bool gotTime = getLocalTime(&t);
     int ntpTries = 0;
-    while (!gotTime && ntpTries < 10) {
+    bool synced = false;
+    while (ntpTries < 15) {
+      if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+        synced = true;
+        break;
+      }
       ntpTries++;
-      Serial.printf("Waiting for NTP time... %d/10\n", ntpTries);
+      Serial.printf("Waiting for NTP sync... %d/15\n", ntpTries);
       delay(1000);
-      gotTime = getLocalTime(&t);
     }
+    struct tm t;
+    bool gotTime = synced && getLocalTime(&t);
     logGetLocalTimeResult("ntpSync/final", gotTime, gotTime ? &t : nullptr);
     logClockState("ntpSync/final");
+    Serial.printf("NTP sync %s after %d seconds\n", synced ? "completed" : "FAILED", ntpTries);
     if (gotTime && syncedTime) *syncedTime = t;
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -583,6 +614,21 @@ int drawHebrewLine(const String& text, int cx, int y, int scale) {
 }
 
 // ──────────────────────────────────────────────────────
+//  Draw lines vertically centred inside the TIME_BOX.
+// ──────────────────────────────────────────────────────
+void drawCenteredLines(const String& l1, const String& l2, const String& l3, int numLines) {
+  int cx    = SCREEN_W / 2;
+  int fontH = FONT_BASE_H * TEXT_SCALE;
+  int visH  = FONT_ASCENT + (numLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
+  int y     = TIME_BOX_Y + (TIME_BOX_H - visH) / 2 + FONT_ASCENT;
+
+  drawHebrewLine(l1, cx, y, TEXT_SCALE);
+  drawHebrewLine(l2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
+  if (numLines == 3)
+    drawHebrewLine(l3, cx, y + 2 * (fontH + LINE_GAP), TEXT_SCALE);
+}
+
+// ──────────────────────────────────────────────────────
 //  Build the two-line phrase for the current time
 // ──────────────────────────────────────────────────────
 static int countWords(const String& s) {
@@ -631,22 +677,17 @@ void splitTimePhrase(const struct tm& t, String& line1, String& line2, String& l
 void drawTimeInWords(const struct tm& t, bool fullRefresh) {
   String line1, line2, line3;
   splitTimePhrase(t, line1, line2, line3);
-  Serial.printf(
-    "Drawing time hour=%d min=%d fullRefresh=%d\n",
-    t.tm_hour,
-    t.tm_min,
-    fullRefresh
-  );
 
   int numLines = (line3.length() > 0) ? 3 : 2;
-  String lines[MAX_LINES] = { line1, line2, line3 };
 
   // Check if anything actually changed since last draw
   if (!fullRefresh) {
     bool anyChanged = (numLines != prevLineCount);
     if (!anyChanged) {
       for (int i = 0; i < numLines; i++) {
-        if (strcmp(lines[i].c_str(), prevLines[i]) != 0) {
+        const char* prev = prevLines[i];
+        const char* cur  = (i == 0) ? line1.c_str() : (i == 1) ? line2.c_str() : line3.c_str();
+        if (strcmp(cur, prev) != 0) {
           anyChanged = true;
           break;
         }
@@ -658,52 +699,45 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
     }
   }
 
-  int cx     = SCREEN_W / 2;
-  int fontH  = FONT_BASE_H * TEXT_SCALE;
+  Serial.printf("Drawing time hour=%d min=%d fullRefresh=%d\n",
+    t.tm_hour, t.tm_min, fullRefresh);
 
-  if (fullRefresh) {
-    epaper.fillScreen(TFT_WHITE);
-    int visH = FONT_ASCENT + (numLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
-    int y    = TIME_BOX_Y + (TIME_BOX_H - visH) / 2 + FONT_ASCENT;
-    drawHebrewLine(line1, cx, y, TEXT_SCALE);
-    drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
-    if (numLines == 3)
-      drawHebrewLine(line3, cx, y + 2 * (fontH + LINE_GAP), TEXT_SCALE);
-    epaper.update();
-  } else {
-    // 1) Reconstruct old image in sprite so controller knows what's on screen
+  bool doFullRefresh = fullRefresh || (partialCount >= FULL_REFRESH_EVERY);
+
+  // For differential partial refresh: render old text first to build
+  // the pixel-perfect old buffer the UC8179 needs for clean transitions.
+  uint8_t* oldBuf = nullptr;
+  if (!doFullRefresh && prevLineCount > 0) {
     epaper.fillRect(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, TFT_WHITE);
-    if (prevLineCount > 0) {
-      int oldNumLines = prevLineCount;
-      int oldVisH = FONT_ASCENT + (oldNumLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
-      int oldY    = TIME_BOX_Y + (TIME_BOX_H - oldVisH) / 2 + FONT_ASCENT;
-      for (int i = 0; i < oldNumLines; i++) {
-        if (prevLines[i][0] != '\0')
-          drawHebrewLine(String(prevLines[i]), cx, oldY + i * (fontH + LINE_GAP), TEXT_SCALE);
-      }
-    }
-    // 2) Snapshot this as "old" for the controller
-    epaper.snapshotRegion(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
-
-    // 3) Now draw the new content
-    epaper.fillRect(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, TFT_WHITE);
-    int visH = FONT_ASCENT + (numLines - 1) * (fontH + LINE_GAP) + FONT_DESCENT;
-    int y    = TIME_BOX_Y + (TIME_BOX_H - visH) / 2 + FONT_ASCENT;
-    drawHebrewLine(line1, cx, y, TEXT_SCALE);
-    drawHebrewLine(line2, cx, y + fontH + LINE_GAP, TEXT_SCALE);
-    if (numLines == 3)
-      drawHebrewLine(line3, cx, y + 2 * (fontH + LINE_GAP), TEXT_SCALE);
-
-    // 4) Partial update with both old and new buffers
-    epaper.updataPartial(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
+    drawCenteredLines(String(prevLines[0]), String(prevLines[1]),
+                      String(prevLines[2]), prevLineCount);
+    oldBuf = epaper.capturePartialWindow(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H);
   }
+
+  // Render new text
+  if (doFullRefresh) epaper.fillScreen(TFT_WHITE);
+  else               epaper.fillRect(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, TFT_WHITE);
+
+  drawCenteredLines(line1, line2, line3, numLines);
+
+  if (doFullRefresh) {
+    epaper.update();
+    partialCount = 0;
+  } else {
+    epaper.updataPartial(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, oldBuf);
+    partialCount++;
+  }
+
+  if (oldBuf) free(oldBuf);
 
   // Save current state for next wake
   for (int i = 0; i < MAX_LINES; i++) {
-    if (i < numLines)
-      strncpy(prevLines[i], lines[i].c_str(), sizeof(prevLines[i]) - 1);
-    else
+    if (i < numLines) {
+      const char* src = (i == 0) ? line1.c_str() : (i == 1) ? line2.c_str() : line3.c_str();
+      strncpy(prevLines[i], src, sizeof(prevLines[i]) - 1);
+    } else {
       prevLines[i][0] = '\0';
+    }
   }
   prevLineCount = numLines;
 

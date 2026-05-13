@@ -1,7 +1,7 @@
 I compile in PowerShell with:
 
 ```powershell
-& "C:\Users\User\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --fqbn espressif:esp32:XIAO_ESP32C3 "c:\projects\smart_board\Arduino\Clock\Clock.ino"
+& "C:\Users\User\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --clean --fqbn espressif:esp32:XIAO_ESP32C3 "c:\projects\smart_board\Arduino\Clock\Clock.ino"
 ```
 
 I upload with:
