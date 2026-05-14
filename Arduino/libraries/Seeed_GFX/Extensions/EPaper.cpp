@@ -33,6 +33,16 @@ void EPaper::begin(uint8_t wake)
 
 }
 
+void EPaper::beginRetainedPowerOff()
+{
+    setBitmapColor(1, 0);
+    setTextFont(1);
+    setTextColor(TFT_BLACK, TFT_WHITE, true);
+    initFromSleep();
+    _sleep = false;
+    _powerOff = true;
+}
+
  void EPaper::drawBufferPixel(int32_t x, int32_t y, uint32_t color, uint8_t bpp)
  {
     _img8[y * (_width / (8 / bpp)) + (x / (8 / bpp))] = color;
@@ -68,7 +78,7 @@ void EPaper::update()
             EPD_UPDATE_GRAY();
       #endif
     }
-    sleep();
+    powerOff();
 }
 
 #ifdef USE_PARTIAL_EPAPER
@@ -158,8 +168,16 @@ void EPaper::updataPartial(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const
     #endif
     EPD_UPDATE_PARTIAL();
 
+    #ifdef EPD_HORIZONTAL_MIRROR
+    EPD_SET_WINDOW(mx0, yy, mx1, yy + hh - 1);
+    EPD_PUSH_OLD_COLORS_FLIP(w_aligned, hh, winbuf);
+    #else
+    EPD_SET_WINDOW(x0, yy, x0 + w_aligned - 1, yy + hh - 1);
+    EPD_PUSH_OLD_COLORS(w_aligned, hh, winbuf);
+    #endif
+
     free(winbuf);
-    sleep();
+    powerOff();
 }
 
 uint8_t* EPaper::capturePartialWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h)

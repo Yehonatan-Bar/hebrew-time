@@ -75,6 +75,7 @@ RTC_DATA_ATTR int    savedSleepSec = 0;
 RTC_DATA_ATTR char   prevLines[MAX_LINES][64];
 RTC_DATA_ATTR int    prevLineCount = 0;
 RTC_DATA_ATTR int    partialCount = 0;
+RTC_DATA_ATTR bool   epdRamValid = false;
 
 struct TimeDebugSnapshot {
   time_t epoch;
@@ -162,7 +163,14 @@ void setup() {
   printSleepSnapshot();
   logClockState("boot/before applyTimeZone");
 
-  epaper.begin();
+  bool retainedWake = !firstBoot && epdRamValid &&
+                      esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+  if (retainedWake) {
+    epaper.beginRetainedPowerOff();
+  } else {
+    epaper.begin(0);
+    epdRamValid = false;
+  }
   epaper.setRotation(0);
 
   // Restore timezone on every boot without restarting SNTP.
@@ -727,6 +735,7 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
     epaper.updataPartial(TIME_BOX_X, TIME_BOX_Y, TIME_BOX_W, TIME_BOX_H, oldBuf);
     partialCount++;
   }
+  epdRamValid = true;
 
   if (oldBuf) free(oldBuf);
 
@@ -748,6 +757,7 @@ void drawTimeInWords(const struct tm& t, bool fullRefresh) {
 //  Error screen
 // ──────────────────────────────────────────────────────
 void drawError(const String& msg) {
+  epdRamValid = false;
   epaper.fillScreen(TFT_WHITE);
   epaper.setTextColor(TFT_BLACK);
   epaper.drawCentreString("Error:",      SCREEN_W/2, SCREEN_H/2 - 30, 4);
