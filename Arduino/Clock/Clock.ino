@@ -45,7 +45,7 @@ const bool  ENABLE_TIME_DEBUG  = true;
 #define SLEEP_SLOW_SEC   300
 #define WIFI_TIMEOUT     20
 #define TIME_OFFSET_SEC  60   // keep the displayed time one minute ahead
-#define FULL_REFRESH_EVERY 60 // full refresh every ~60 partial cycles to clear ghosting
+#define FULL_REFRESH_EVERY 15 // full refresh every ~15 partial cycles to clear ghosting
 
 // ── Layout ────────────────────────────────────────────
 #define SCREEN_W         800
@@ -59,7 +59,7 @@ const bool  ENABLE_TIME_DEBUG  = true;
 
 // Rectangle that gets cleared & redrawn (must satisfy 8-px X alignment for partial refresh)
 #define TIME_BOX_X       0
-#define TIME_BOX_Y       70
+#define TIME_BOX_Y       60
 #define TIME_BOX_W       800
 #define TIME_BOX_H       400
 
